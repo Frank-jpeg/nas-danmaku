@@ -46,7 +46,9 @@ class AutoTests(unittest.TestCase):
         cache = patch.object(d, 'local_workspace', side_effect=lambda: Path(tempfile.mkdtemp(dir=self.folder)))
         titles = patch.object(d, 'title_subtitles', return_value=[])
         online = patch.object(d, 'online_subtitles', return_value=[])
-        for fixture in (cache, titles, online):
+        subhd = patch.object(d, 'subhd_subtitles', return_value=[])
+        subtitlecat = patch.object(d, 'subtitlecat_subtitles', return_value=[])
+        for fixture in (cache, titles, online, subhd, subtitlecat):
             fixture.start()
             self.addCleanup(fixture.stop)
         # 保留真实在线解析函数，单独测试时使用。

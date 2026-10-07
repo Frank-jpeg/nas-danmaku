@@ -27,6 +27,10 @@ class LocalPipelineTests(unittest.TestCase):
         fixture = patch.object(d, 'local_workspace', return_value=self.cache)
         fixture.start()
         self.addCleanup(fixture.stop)
+        for name in ('subhd_subtitles', 'subtitlecat_subtitles'):
+            fixture = patch.object(d, name, return_value=[])
+            fixture.start()
+            self.addCleanup(fixture.stop)
         self.meta = {'format': {'duration': '20'}, 'streams': [{'index': 3, 'codec_type': 'subtitle',
                      'codec_name': 'subrip', 'tags': {'language': 'chi'}}]}
 

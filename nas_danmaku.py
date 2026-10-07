@@ -7,7 +7,10 @@ import base64
 import copy
 import hashlib
 import html
+from html.parser import HTMLParser
 import http.client
+import http.cookiejar
+import io
 import json
 import math
 import os
@@ -23,10 +26,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import webbrowser
+import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
@@ -617,7 +622,9 @@ HELP = """字幕弹幕一键合成 v2（单文件）
 只需要这一个 .py；Python 3.10+（含 Tkinter）。读取影片信息和内封文字字幕需要先安装 ffprobe/ffmpeg，并确保可在命令行中运行。
 路径必须是 Windows 能读取的本地/映射盘/UNC 路径。极空间 App 里的虚拟路径或分享链接不能直接当文件路径。
 
-自动字幕：同目录外挂中文字幕 → 迅雷按片名/年份搜索 → 射手按影片四段指纹搜索。
+自动字幕：同目录外挂中文字幕 → 迅雷 → SubHD → 射手指纹 → SubtitleCat（可能机翻）。
+已有可用结果就停止查询；失败自动换源，原因会显示在日志。顶部“网页找字幕”可到 ASSRT 等网站手动补选。
+ZIP 字幕包直接读取；7z/RAR 包需要本机已有 7-Zip。只下载现成字幕，不自动发起翻译或绕过网站验证。
 若只有 PGS/SUP 图片字幕且在线未找到文字字幕，会明确提示；本工具不做 OCR、不假装已成功。
 内封字幕只在手动点“使用内封”后选用；提取可能需扫描影片，异地较慢。
 台词和弹幕先缓存到本机，合成后仅将最终 ASS 写回 NAS；不下载整部视频。
@@ -626,7 +633,7 @@ NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS
 
 弹幕：按片名通过 360 影视查找电影平台链接，再向公开弹幕库按需请求；不需要你填密钥。
 公开服务： https://dmku.hls.one/ ；备用 https://danmu.zxz.ee/ 。
-在线字幕：迅雷字幕按片名查询；备用 https://www.shooter.cn/api/subapi.php 按视频指纹查询。
+在线字幕：迅雷、SubHD 按片名查询；射手按视频指纹查询；SubtitleCat 作为可能机翻的末位备用。
 这些外部服务可能变更/限流、没有某部电影的数据。失败会显示原因，支持修改片名重新识别或手动补选文件。
 只发送查询片名、影片文件名/四段 MD5 和公开平台链接；不上传电影、原台词内容、NAS 目录或账号。
 
@@ -640,17 +647,19 @@ NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS
 """
 
 
-def web_bytes(url, data=None, timeout=25, progress=None, message="下载数据"):
+def web_bytes(url, data=None, timeout=25, progress=None, message="下载数据", opener=None, request_headers=None):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username or parsed.password:
         raise ToolError("服务返回了无效的下载链接。")
     headers = {"User-Agent": "Mozilla/5.0 SubtitleDanmaku/2.0", "Accept-Encoding": "identity"}
     if data is not None:
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if request_headers:
+        headers.update(request_headers)
     req = urllib.request.Request(url, data=data, headers=headers)
     report(progress, message)
     try:
-        with urllib.request.build_opener(SafeRedirect()).open(req, timeout=timeout) as response:
+        with (opener or urllib.request.build_opener(SafeRedirect())).open(req, timeout=timeout) as response:
             length = response.headers.get("Content-Length", "")
             total = int(length) if length.isdigit() and not response.headers.get("Transfer-Encoding") else None
             if total is not None and total > MAX_BYTES:
@@ -949,6 +958,248 @@ def title_subtitles(video, identity, meta, progress=None):
     return choices
 
 
+class PageLinks(HTMLParser):
+    """只读取页面上的链接和文字，不执行脚本。"""
+    def __init__(self, source):
+        super().__init__(convert_charrefs=True)
+        self.links, self.active = [], None
+        self.feed(source)
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.active = [dict(attrs), []]
+
+    def handle_data(self, data):
+        if self.active is not None:
+            self.active[1].append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self.active is not None:
+            attrs, parts = self.active
+            self.links.append((attrs, " ".join("".join(parts).split())))
+            self.active = None
+
+
+class SubtitleSession:
+    def __init__(self, label, base, progress, budget=45):
+        self.label, self.base, self.progress = label, base, progress
+        self.deadline = time.monotonic() + budget
+        self.opener = urllib.request.build_opener(SafeRedirect(), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+    def get(self, url, data=None, referer=None):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ToolError(self.label + "本次查询超时，切换下一来源。")
+        headers = {"Referer": referer or self.base}
+        if data is not None:
+            data = json.dumps(data).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        return web_bytes(url, data=data, timeout=min(12, remaining), progress=self.progress,
+                         message="查询/下载 " + self.label, opener=self.opener, request_headers=headers)
+
+    def page(self, url):
+        return self.get(url).decode("utf-8-sig", errors="replace")
+
+    def post(self, path, data, referer):
+        try:
+            result = json.loads(self.get(self.base + path, data, referer))
+        except (ValueError, UnicodeError):
+            raise ToolError(self.label + "返回的不是有效数据，可能需要在网页验证。") from None
+        if not isinstance(result, dict) or result.get("success") is not True:
+            raise ToolError(self.label + "下载受限或需网页确认：" + str(result.get("msg", "") if isinstance(result, dict) else ""))
+        return result
+
+
+def subtitle_queries(video, identity):
+    titles = [identity["title"], filename_title(Path(video).stem)[0]]
+    queries = []
+    for title in titles:
+        bilingual = re.match(r"^([\u4e00-\u9fff][^A-Za-z]*?)\s+([A-Za-z].*)$", title)
+        queries.extend([bilingual[1].strip(), bilingual[2].strip()] if bilingual else [title])
+    return list(dict.fromkeys(q for q in queries if q.strip()))
+
+
+def candidate_matches(name, queries, year):
+    name = urllib.parse.unquote(name)
+    if not any(normalize_title(q) in normalize_title(name) for q in queries):
+        return False
+    years = re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", name)
+    if year and years and year not in years:
+        return False
+    return not re.search(r"(?i)(?:^|[. _\-])(?:cd|disc|disk|d)[ ._\-]*[1-9](?:[. _\-]|$)", name)
+
+
+def safe_archive_member(name):
+    parts = name.replace("\\", "/").split("/")
+    return bool(name) and not name.startswith(("/", "\\", "-", "@")) and ":" not in name and ".." not in parts
+
+
+def subtitle_archive_members(raw):
+    """仅返回文字字幕字节；压缩包里的路径不落地。"""
+    if raw.startswith(b"PK"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                items = archive.infolist()
+                if len(items) > 100 or sum(i.file_size for i in items) > MAX_BYTES:
+                    raise ToolError("字幕压缩包解压总量或文件数超限。")
+                for item in items:
+                    if safe_archive_member(item.filename) and not item.flag_bits & 1 and Path(item.filename).suffix.lower() in {".ass", ".srt"}:
+                        yield item.filename, archive.read(item)
+        except (zipfile.BadZipFile, RuntimeError, NotImplementedError) as exc:
+            raise ToolError("无法读取字幕 ZIP：" + str(exc)) from exc
+        return
+    if not raw.startswith((b"7z\xbc\xaf\x27\x1c", b"Rar!")):
+        text = decode_subtitle(raw)
+        yield "subtitle.ass" if "[Events]" in text else "subtitle.srt", raw
+        return
+    executable = shutil.which("7z") or shutil.which("7zz")
+    if not executable:
+        installed = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "7-Zip" / "7z.exe"
+        executable = str(installed) if installed.is_file() else None
+    if not executable:
+        raise ToolError("字幕为 7z/RAR 包，需要安装 7-Zip 并加入 PATH；将继续尝试其他来源。")
+    with tempfile.TemporaryDirectory(prefix="nas-subtitles-") as temporary:
+        archive = Path(temporary) / "subtitle.archive"
+        archive.write_bytes(raw)
+        def run(args):
+            try:
+                result = subprocess.run([executable] + args, stdin=subprocess.DEVNULL, capture_output=True,
+                                        timeout=20, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except subprocess.TimeoutExpired as exc:
+                raise ToolError("字幕压缩包处理超时。") from exc
+            if result.returncode or len(result.stdout) > MAX_BYTES:
+                raise ToolError("字幕压缩包损坏、加密或解压大小超限。")
+            return result.stdout
+        listing = run(["l", "-slt", "-sccUTF-8", str(archive)]).decode("utf-8-sig", errors="replace")
+        if "----------" not in listing:
+            raise ToolError("无法识别 7-Zip 文件列表。")
+        items = [dict(line.split(" = ", 1) for line in block.splitlines() if " = " in line)
+                 for block in re.split(r"\r?\n\r?\n", listing.split("----------", 1)[1].strip())]
+        if len(items) > 100 or any(not item.get("Size", "0").isdigit() for item in items) or sum(int(i.get("Size", 0)) for i in items) > MAX_BYTES:
+            raise ToolError("字幕压缩包解压总量或文件数超限。")
+        for item in items:
+            name = item.get("Path", "")
+            if not safe_archive_member(name) or item.get("Encrypted") == "+" or Path(name).suffix.lower() not in {".srt", ".ass"}:
+                continue
+            yield name, run(["x", "-so", "-bd", "-bb0", "-bsp0", "-spd", str(archive), name])
+
+
+def downloaded_choices(raw, source, title, meta, machine=False):
+    choices = []
+    length = finite(meta.get("format", {}).get("duration", 0) or 0)
+    for name, content in subtitle_archive_members(raw):
+        try:
+            text = decode_subtitle(content)
+            doc = parse_ass(text) if Path(name).suffix.lower() == ".ass" else parse_srt(text)
+            chinese = sum(bool(re.search(r"[\u4e00-\u9fff]", e["Text"])) for e in doc.events)
+            if len(doc.events) < 10 or chinese < min(5, max(1, len(doc.events) // 20)):
+                continue
+            if re.search(r"(?i)(?:^|[. _\-])(?:cd|disc|disk|d)[ ._\-]*[1-9](?:[. _\-]|$)", name):
+                continue
+            end = max(stamp(e["End"]) for e in doc.events) / 100
+            if length and not length * .70 <= end <= length * 1.10:
+                continue
+            score = 100 + (10 if re.search(r"(?i)(简|chs|zh-cn)", name) else 0)
+            label = f"在线 · {source}" + (" · 可能机翻" if machine else "") + " · " + title[:70]
+            if name not in {"subtitle.ass", "subtitle.srt"}:
+                label += " · " + Path(name).name[-55:]
+            choices.append(SubtitleChoice(label, "online", score, doc=doc))
+        except (ToolError, UnicodeError):
+            continue
+    return sorted(choices, key=lambda c: -c.score)[:3]
+
+
+def subhd_subtitles(video, identity, meta, progress=None):
+    queries = subtitle_queries(video, identity)
+    session = SubtitleSession("SubHD", "https://subhd.tv", progress)
+    search = session.base + "/search/" + urllib.parse.quote(queries[0], safe="")
+    links = PageLinks(session.page(search)).links
+    candidates = {}
+    for attrs, title in links:
+        href = attrs.get("href", "")
+        if re.fullmatch(r"/a/[A-Za-z0-9]+", href):
+            candidates[href] = candidates.get(href, "") + " " + title
+    candidates = [(href, title.strip()) for href, title in candidates.items()
+                  if candidate_matches(title, queries, identity.get("year", ""))]
+    candidates.sort(key=lambda item: ("国配" in item[1], "特效" in item[1], -language_score(item[1])))
+    errors = []
+    for href, title in candidates[:3]:
+        detail = session.base + href
+        try:
+            session.page(detail)
+            sid = href.rsplit("/", 1)[1]
+            prepared = session.post("/api/sub/prepare-download", {"sid": sid}, detail)
+            path = prepared.get("url", "")
+            if not isinstance(path, str) or not re.fullmatch(r"/down/[A-Za-z0-9]+", path):
+                raise ToolError("SubHD 未提供有效下载页。")
+            session.page(session.base + path)
+            data = session.post("/api/sub/down", {"sid": sid}, session.base + path)
+            if data.get("pass") is not True or not isinstance(data.get("url"), str):
+                raise ToolError("SubHD 需要在网页完成验证，已跳过自动下载。")
+            raw = session.get(data["url"], referer=session.base + path)
+            choices = downloaded_choices(raw, "SubHD", title, meta)
+            if choices:
+                return choices
+            errors.append("候选中未找到完整中文字幕")
+        except (ToolError, OSError) as exc:
+            errors.append(str(exc))
+            if "验证" in str(exc) or "HTTP 403" in str(exc) or "HTTP 429" in str(exc):
+                break
+    if candidates:
+        raise ToolError("SubHD 找到候选但未能取得字幕：" + "；".join(dict.fromkeys(errors)))
+    return []
+
+
+def subtitlecat_subtitles(video, identity, meta, progress=None):
+    queries = subtitle_queries(video, identity)
+    query = next((q for q in queries if re.search(r"[A-Za-z]", q)), queries[0])
+    session = SubtitleSession("SubtitleCat", "https://www.subtitlecat.com", progress)
+    links = PageLinks(session.page(session.base + "/index.php?" + urllib.parse.urlencode({"search": query}))).links
+    candidates = []
+    for attrs, title in links:
+        href = attrs.get("href", "")
+        if re.fullmatch(r"/?subs/\d+/[^?#]+\.html", href) and candidate_matches(title, queries, identity.get("year", "")):
+            candidates.append((urllib.parse.urljoin(session.base + "/", href), title))
+    errors = []
+    for detail, title in candidates[:3]:
+        try:
+            links = PageLinks(session.page(detail)).links
+            for language in ("download_zh-CN", "download_zh-TW"):
+                for attrs, _ in links:
+                    href = attrs.get("href", "")
+                    if attrs.get("id") != language or not re.fullmatch(r"/subs/\d+/[^?#]+\.srt", href):
+                        continue
+                    url = session.base + urllib.parse.quote(urllib.parse.unquote(href), safe="/.-_")
+                    choices = downloaded_choices(session.get(url), "SubtitleCat", title, meta, machine=True)
+                    if choices:
+                        return choices
+        except (ToolError, OSError) as exc:
+            errors.append(str(exc))
+    if candidates:
+        raise ToolError("SubtitleCat 有候选，但没有可直接下载的完整中文字幕。" + "；".join(dict.fromkeys(errors)))
+    return []
+
+
+def fetch_subtitle_backups(video, identity, meta, progress, warnings):
+    sources = [("迅雷", lambda: title_subtitles(video, identity, meta, progress)),
+               ("SubHD", lambda: subhd_subtitles(video, identity, meta, progress)),
+               ("射手指纹", lambda: online_subtitles(video)),
+               ("SubtitleCat（可能机翻）", lambda: subtitlecat_subtitles(video, identity, meta, progress))]
+    for label, fetch in sources:
+        progress("正在查询字幕来源：" + label)
+        try:
+            choices = fetch()
+        except (ToolError, OSError) as exc:
+            warnings.append(label + "：" + str(exc))
+            continue
+        if choices:
+            if label.startswith("SubtitleCat"):
+                warnings.append("SubtitleCat 是机翻可能性较高的备用字幕，请检查翻译质量与时间轴。")
+            return choices
+        warnings.append(label + "：本次未找到匹配的可用字幕。")
+    return []
+
+
 def discover_subtitles(video, meta, progress, identity=None, folder=None):
     choices = []
     warnings = []
@@ -965,17 +1216,7 @@ def discover_subtitles(video, meta, progress, identity=None, folder=None):
             warnings.append("外挂字幕读取失败：" + str(exc))
     # 不再因为有内封中文而跳过在线查询；默认合成不扫描远程视频。
     if not choices or max(c.score for c in choices) < 90:
-        try:
-            online = title_subtitles(video, identity or identify_movie(video), meta, progress)
-        except (ToolError, OSError) as exc:
-            warnings.append(str(exc))
-            online = []
-        if not online:
-            progress("正在按影片指纹查找备用在线字幕（少量读取影片）…")
-            try:
-                online = online_subtitles(video)
-            except (ToolError, OSError) as exc:
-                warnings.append(str(exc))
+        online = fetch_subtitle_backups(video, identity or identify_movie(video), meta, progress, warnings)
         for choice in online:
             try:
                 choices.append(cache_subtitle(choice, folder))
@@ -1352,6 +1593,7 @@ class App:
         head.pack(fill="x")
         ttk.Label(head, text="字幕＋弹幕", style="Title.TLabel").pack(side="left")
         ttk.Button(head, text="使用说明", command=self.help).pack(side="right")
+        ttk.Button(head, text="网页找字幕", command=self.subtitle_sites).pack(side="right", padx=6)
         ttk.Label(p, text="选择一部电影，找到台词和弹幕，合成一条字幕放回原目录。", foreground="#606975").pack(anchor="w", pady=(4, 10))
         row = ttk.Frame(p)
         row.pack(fill="x")
@@ -1426,6 +1668,24 @@ class App:
         text.pack(fill="both", expand=True)
         text.insert("1.0", HELP)
         text.configure(state="disabled")
+
+    def subtitle_sites(self):
+        title = self.title.get().strip()
+        if not title and self.path.get().strip():
+            title = filename_title(Path(self.path.get().strip().strip('"')).stem)[0]
+        if not title:
+            return messagebox.showinfo("先填片名", "请先选择影片，或在识别片名框填写电影名。")
+        win = tk.Toplevel(self.root)
+        win.title("字幕网站补选")
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="自动来源没有合适版本时，可在网站搜索后下载 SRT/ASS，再点“补选字幕”。", wraplength=500).pack(anchor="w", pady=(0, 10))
+        sites = [("ASSRT（伪射手）", "https://assrt.net/sub/?" + urllib.parse.urlencode({"searchword": title})),
+                 ("SubHD", "https://subhd.tv/search/" + urllib.parse.quote(title, safe="")),
+                 ("SubtitleCat（可能机翻）", "https://www.subtitlecat.com/index.php?" + urllib.parse.urlencode({"search": title}))]
+        for label, url in sites:
+            ttk.Button(frame, text=label, command=lambda u=url: webbrowser.open_new_tab(u)).pack(fill="x", pady=4)
+        ttk.Label(frame, text="需要验证码、登录或付费时请在网页自行处理；工具不会绕过这些限制。", wraplength=500).pack(anchor="w", pady=(10, 0))
 
     def log(self, text):
         self.log_box.configure(state="normal")

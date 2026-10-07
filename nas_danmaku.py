@@ -31,14 +31,14 @@ import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
 TEXT_CODECS = {"ass", "ssa", "subrip", "srt", "mov_text", "text", "webvtt"}
 DM_DEFAULTS = dict(font_size=32, duration=8, area=25, opacity=80, block_scroll=False,
                    block_fixed=True, block_color=False, avoid_subtitles=True, deduplicate=True,
-                   block_noise=True, block_keywords="")
+                   block_noise=True, block_keywords="", filter_rules=None)
 
 
 class ToolError(Exception):
@@ -478,52 +478,213 @@ def compile_block_keywords(text):
     return tuple(words)
 
 
-def watch_sentence(text):
+def watch_sentence(text, words=_WATCH_WORDS):
     # 有人/有+人等存在多种切分；用有界动态规划，避免重复正则回溯拖慢合成。
     reachable = {0}
     for start in range(len(text)):
         if start in reachable:
             for end in range(start + 1, min(len(text), start + 10) + 1):
-                if _WATCH_WORDS.fullmatch(text[start:end]):
+                if words.fullmatch(text[start:end]):
                     reachable.add(end)
     return len(text) in reachable
 
 
-def blocked_comment_reason(text, enabled=True, keywords=()):
-    normal = filter_text(text)
-    if any(word in normal for word in keywords):
-        return "自定义关键词"
-    if not enabled:
-        return ""
-    plain = "".join(c for c in normal if c.isalnum())
-    if _REPEATED_ASCII.fullmatch(plain):
-        return "重复字符刷屏"
-    # 内置规则针对短打卡/闲聊句式，避免把较长的剧情分析当成打卡。
+RULE_TYPES = {"keyword": "普通关键词（包含就屏蔽）", "full": "正则（整句匹配，去标点）",
+              "search": "正则（部分匹配，保留标点）", "date": "组合规则：日期打卡", "watch": "组合规则：观看打卡"}
+RULE_FIELDS = {"keyword": ("pattern",), "full": ("pattern",), "search": ("pattern",),
+               "date": ("date", "year", "time", "words", "companion"), "watch": ("pattern", "words")}
+RULE_FIELD_LABELS = {"pattern": "匹配内容", "date": "日期写法", "year": "年份写法", "time": "时刻写法",
+                     "words": "打卡用语（单个词）", "companion": "陪同观看句式"}
+
+
+def default_filter_rules():
+    rows = [
+        ("repeat", "重复字母数字", "full", {"pattern": _REPEATED_ASCII.pattern},
+         "整句由同一段字母/数字重复至少六遍。", "AAAAAAA", "哈哈哈哈哈哈"),
+        ("promotion", "广告引流", "search", {"pattern": _PROMOTION.pattern},
+         "句中包含明确的加群、领取资源等广告写法。", "加QQ群123456789", "他用微信联系家人"),
+        ("presence", "打卡或找人聊天", "full", {"pattern": _PRESENCE.pattern},
+         "整句是前排、签到、在吗等短语；最多连续重复八次。", "在吗？在吗？", "有人看懂这个结尾吗"),
+        ("companion", "陪同观看打卡", "full", {"pattern": _COMPANION.pattern},
+         "整句在报告和谁看电影，保留带具体剧情内容的句子。", "今天和女朋友一起看", "男主和妻子一起看日落"),
+        ("date", "日期或时间打卡", "date",
+         {"date": _DATE_TOKEN.pattern, "year": _YEAR_TOKEN.pattern, "time": _TIME_TOKEN.pattern,
+          "words": _WATCH_WORDS.pattern, "companion": _COMPANION.pattern},
+         "先去除日期/时间；剩下全是打卡用语或陪看句式才屏蔽。单独一个年份保留。下面五项都可查看和修改。",
+         "2026年10月7日20:30打卡", "1998年上映的电影"),
+        ("watch", "报几刷或观看打卡", "watch",
+         {"pattern": r"打卡|签到|报到|第.{1,4}次|.{1,4}刷", "words": _WATCH_WORDS.pattern},
+         "命中打卡或几刷，且整句都由打卡用语组成才屏蔽。", "我来二刷了", "二刷才注意到这个伏笔"),
+    ]
+    return [dict(id=key, name=name, kind=kind, parts=parts, description=description,
+                 example=example, keep_example=keep, enabled=True, builtin=True)
+            for key, name, kind, parts, description, example, keep in rows]
+
+
+def compile_filter_rules(rules):
+    if not isinstance(rules, list) or len(rules) > 150:
+        raise ToolError("屏蔽规则需要是列表，最多 150 条。")
+    compiled, ids = [], set()
+    for item in rules:
+        if not isinstance(item, dict):
+            raise ToolError("屏蔽规则格式不正确。")
+        key, name, kind = item.get("id"), item.get("name"), item.get("kind")
+        if not isinstance(key, str) or not key or len(key) > 80 or key in ids:
+            raise ToolError("屏蔽规则编号为空、重复或过长。")
+        ids.add(key)
+        if (not isinstance(name, str) or not name.strip() or len(name) > 80 or
+                not isinstance(kind, str) or kind not in RULE_TYPES):
+            raise ToolError("每条规则需要名称（最多 80 字）和有效类型。")
+        if not isinstance(item.get("enabled"), bool) or not isinstance(item.get("builtin"), bool):
+            raise ToolError(f"规则“{name}”的开关格式不正确。")
+        for field_name in ("description", "example", "keep_example"):
+            if not isinstance(item.get(field_name, ""), str) or len(item.get(field_name, "")) > 1000:
+                raise ToolError(f"规则“{name}”的说明或示例过长。")
+        parts = item.get("parts")
+        if not isinstance(parts, dict) or set(parts) != set(RULE_FIELDS[kind]):
+            raise ToolError(f"规则“{name}”缺少必要的匹配内容。")
+        expressions = {}
+        for field_name, pattern in parts.items():
+            if not isinstance(pattern, str) or not pattern.strip() or len(pattern) > 2000:
+                raise ToolError(f"规则“{name}”的{RULE_FIELD_LABELS[field_name]}不能为空，最多 2000 字。")
+            if kind == "keyword":
+                expressions[field_name] = filter_text(pattern)
+                if not expressions[field_name]:
+                    raise ToolError("关键词不能只包含空白字符。")
+            else:
+                try:
+                    expressions[field_name] = re.compile(pattern, re.IGNORECASE)
+                except (re.error, OverflowError, RecursionError) as exc:
+                    raise ToolError(f"规则“{name}”的{RULE_FIELD_LABELS[field_name]}正则写法有误：{exc}") from exc
+        compiled.append((item, expressions))
+    return compiled
+
+
+def _rule_matches(normal, plain, item, expressions):
+    kind = item["kind"]
+    if kind == "keyword":
+        return expressions["pattern"] in normal
+    # 正则只检查不超过 180 字的短弹幕；关键词不受此限制。
     if len(normal) > 180:
-        return ""
-    if _PROMOTION.search(normal):
-        return "广告引流"
-    if _PRESENCE.fullmatch(plain):
-        return "打卡或找人聊天"
-    if _COMPANION.fullmatch(plain):
-        return "陪同观看打卡"
-    has_date = _DATE_TOKEN.search(normal) is not None
-    has_time = _TIME_TOKEN.search(normal) is not None
-    has_year = _YEAR_TOKEN.search(normal) is not None
-    without_stamps = _TIME_TOKEN.sub("", _YEAR_TOKEN.sub("", _DATE_TOKEN.sub("", normal)))
-    remainder = "".join(c for c in without_stamps if c.isalnum())
-    if (has_date or has_time or (has_year and remainder)) and watch_sentence(remainder):
-        return "日期或时间打卡"
-    if (has_date or has_time or has_year) and _COMPANION.fullmatch(remainder):
-        return "陪同观看打卡"
-    if plain and re.search(r"打卡|签到|报到|第.{1,4}次|.{1,4}刷", plain) and watch_sentence(plain):
-        return "观看打卡"
-    return ""
+        return False
+    if kind == "full":
+        return expressions["pattern"].fullmatch(plain) is not None
+    if kind == "search":
+        return expressions["pattern"].search(normal) is not None
+    if kind == "watch":
+        return bool(plain and expressions["pattern"].search(plain) and watch_sentence(plain, expressions["words"]))
+    has_date = expressions["date"].search(normal) is not None
+    has_time = expressions["time"].search(normal) is not None
+    has_year = expressions["year"].search(normal) is not None
+    remaining = expressions["time"].sub("", expressions["year"].sub("", expressions["date"].sub("", normal)))
+    remaining = "".join(c for c in remaining if c.isalnum())
+    return ((has_date or has_time or (has_year and remaining)) and watch_sentence(remaining, expressions["words"])) or (
+        (has_date or has_time or has_year) and expressions["companion"].fullmatch(remaining) is not None)
+
+
+def _evaluate_filter_rules(texts, rules, enabled=True, all_matches=False):
+    compiled = compile_filter_rules(rules)
+    results = []
+    for text in texts:
+        normal = filter_text(text)
+        plain = "".join(c for c in normal if c.isalnum())
+        matches = []
+        for item, expressions in compiled:
+            if item["enabled"] and (enabled or not item["builtin"]) and _rule_matches(normal, plain, item, expressions):
+                matches.append(dict(id=item["id"], name=item["name"], builtin=item["builtin"]))
+                if not all_matches:
+                    break
+        results.append(matches)
+    return results
+
+
+def evaluate_filter_rules(texts, rules, enabled=True, all_matches=False, timeout=15):
+    compile_filter_rules(rules)
+    trusted = {(r["kind"], tuple(sorted(r["parts"].items()))) for r in default_filter_rules()}
+    changed_regex = any(r["enabled"] and (enabled or not r["builtin"]) and r["kind"] != "keyword" and
+                        (r["kind"], tuple(sorted(r["parts"].items()))) not in trusted for r in rules)
+    if not changed_regex:
+        return _evaluate_filter_rules(texts, rules, enabled, all_matches)
+    # 用户可编辑正则可能回溯很久；放入无窗口子进程，超时终止，不让合成或测试卡死。
+    executable = Path(sys.executable)
+    if executable.name.lower() == "pythonw.exe" and executable.with_name("python.exe").exists():
+        executable = executable.with_name("python.exe")
+    payload = json.dumps(dict(texts=texts, rules=rules, enabled=enabled, all_matches=all_matches), ensure_ascii=False).encode("utf-8")
+    try:
+        result = subprocess.run([str(executable), str(Path(__file__).absolute()), "--_filter-rules-worker"],
+                                input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired as exc:
+        raise ToolError("屏蔽正则匹配超时，请停用或修改最近编辑的正则；本次未完成过滤。") from exc
+    if result.returncode:
+        raise ToolError("屏蔽规则执行失败：" + result.stderr.decode("utf-8", errors="replace")[-600:])
+    return json.loads(result.stdout.decode("utf-8"))
+
+
+def rules_with_keywords(rules=None, keywords=()):
+    rows = copy.deepcopy(default_filter_rules() if rules is None else rules)
+    for index, word in enumerate(keywords):
+        rows.insert(index, dict(id=f"legacy-{index}", name="自定义关键词", kind="keyword", parts={"pattern": word},
+                                enabled=True, builtin=False, description="包含该词的弹幕会被屏蔽。", example="", keep_example=""))
+    return rows
+
+
+def blocked_comment_reason(text, enabled=True, keywords=(), rules=None):
+    matches = evaluate_filter_rules([text], rules_with_keywords(rules, keywords), enabled)[0]
+    return matches[0]["name"] if matches else ""
+
+
+def filter_rules_path():
+    folder = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "NasDanmaku"
+    return folder / "block-rules.local.json"
+
+
+def load_filter_rules(path=None):
+    path = Path(path) if path is not None else filter_rules_path()
+    if not path.exists():
+        return default_filter_rules()
+    try:
+        if path.stat().st_size > 512000:
+            raise ToolError("屏蔽规则文件超过大小限制。")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("version") != 1:
+            raise ToolError("屏蔽规则文件版本不支持。")
+        compile_filter_rules(data["rules"])
+        return data["rules"]
+    except (OSError, ValueError, KeyError, AttributeError) as exc:
+        raise ToolError("读取屏蔽规则失败：" + str(exc)) from exc
+
+
+def save_filter_rules(rules, path=None, backup_dir=None):
+    compile_filter_rules(rules)
+    path = Path(path) if path is not None else filter_rules_path()
+    content = json.dumps(dict(version=1, rules=rules), ensure_ascii=False, indent=2) + "\n"
+    if len(content.encode("utf-8")) > 512000:
+        raise ToolError("屏蔽规则文件超过大小限制。")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        if path.exists():
+            if path.read_text(encoding="utf-8") == content:
+                return
+            backups = Path(backup_dir) if backup_dir is not None else (
+                Path("D:/临时备份/NasDanmaku") if os.name == "nt" else path.parent / "backups")
+            backups.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, backups / ("block-rules-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8] + ".json"))
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+        os.replace(temporary, path)
+    except (OSError, UnicodeError) as exc:
+        raise ToolError("屏蔽规则未保存（备份或写入失败）：" + str(exc)) from exc
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def render_comments(comments, resolution, offset=0, density=6, duration=8, font_size=32, progress=None,
                     *, area=25, opacity=80, block_scroll=False, block_fixed=True, block_color=False,
-                    avoid_subtitles=True, deduplicate=True, block_noise=True, block_keywords="", filter_stats=None):
+                    avoid_subtitles=True, deduplicate=True, block_noise=True, block_keywords="", filter_stats=None,
+                    filter_rules=None):
     width, height = resolution
     offset, duration, font_size = finite(offset, "弹幕偏移"), finite(duration, "滚动时长"), finite(font_size, "字号")
     density, area, opacity = finite(density, "同屏条数"), finite(area, "显示区域"), finite(opacity, "不透明度")
@@ -552,8 +713,11 @@ def render_comments(comments, resolution, offset=0, density=6, duration=8, font_
         doc.styles["Scroll"][key] = f"&H{alpha:02X}" + doc.styles["Scroll"][key][-6:]
     seen, omitted = {}, 0
     total = len(comments)
+    ordered = sorted(comments, key=lambda x: x.time)
+    report(progress, "应用弹幕屏蔽规则")
+    matches = evaluate_filter_rules([c.text for c in ordered], rules_with_keywords(filter_rules, keywords), block_noise)
     report(progress, "排列弹幕", 0, total, "条")
-    for index, comment in enumerate(sorted(comments, key=lambda x: x.time)):
+    for index, comment in enumerate(ordered):
         # 计数指已检查的条目，包含去重/限流丢弃项。
         if index and index % max(1, total // 100) == 0:
             report(progress, "排列弹幕", index, total, "条")
@@ -565,11 +729,10 @@ def render_comments(comments, resolution, offset=0, density=6, duration=8, font_
         if (fixed and block_fixed) or (not fixed and block_scroll) or (block_color and comment.color != 0xFFFFFF):
             omitted += 1
             continue
-        reason = blocked_comment_reason(comment.text, block_noise, keywords)
-        if reason:
+        if matches[index]:
             omitted += 1
             if filter_stats is not None:
-                filter_stats["keywords" if reason == "自定义关键词" else "noise"] += 1
+                filter_stats["noise" if matches[index][0]["builtin"] else "keywords"] += 1
             continue
         message = escape_text(comment.text)[:120]
         if original_at < 0 or (deduplicate and message in seen and at - seen[message] < 15):
@@ -773,7 +936,7 @@ THUNDER_SUBTITLE_API = "https://api-shoulei-ssl.xunlei.com/oracle/subtitle"
 KAN_SEARCH = "https://api.so.360kan.com/index"
 PLATFORMS = {"qq": "腾讯视频", "qiyi": "爱奇艺", "bilibili1": "哔哩哔哩", "youku": "优酷", "imgo": "芒果TV"}
 HOSTS = ("qq.com", "iqiyi.com", "bilibili.com", "youku.com", "mgtv.com")
-HELP = """字幕弹幕一键合成 v2（单文件）
+HELP = "字幕弹幕一键合成 v" + VERSION + """（单文件）
 
 使用：选择影片 → 自动识别片名、字幕及弹幕 → 核对下面的结果 → 确认合成。
 输出：影片原目录 / 弹幕版-影片完整文件名.ass。同名则自动加 -v2，不覆盖原文件。
@@ -802,11 +965,18 @@ NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS
 默认弹幕只在顶部 1/4 滚动，字号 32（1080p 基准）、不透明度 80%、最多同屏 6 条，屏蔽固定弹幕。
 同向弹幕留够安全间距即可接续进入，按同屏上限分散进入节奏，不再等待整批走完；原时间点不后移。
 默认过滤日期/时间打卡、报几刷、陪谁看、在吗/有人吗、重复字母数字及明显广告；“弹幕设置”可关闭。
-可在“自定义屏蔽词”每行填一个普通词，包含该词的弹幕会被过滤；自定义词独立于内置过滤开关。
+在“弹幕设置 → 屏蔽规则（内置＋自定义）”查看全部六条内置规则，可修改、停用、删除或恢复默认。
+每条规则都有用途、屏蔽/保留示例和实际匹配内容；日期等组合规则可通过下拉列表逐项编辑。
+可新增普通关键词（包含就屏蔽），也可新增正则（按写法规律匹配）。不懂正则，直接用关键词即可。
+输入一句弹幕点“测试这句弹幕”，能看到是否屏蔽、具体命中了哪些规则；示例文字仅作说明。
+“保存规则”后返回，再点“应用设置”。规则及各条开关保存在本机，重启仍保留；自定义规则独立于内置总开关。
+规则文件：%LOCALAPPDATA%/NasDanmaku/block-rules.local.json；修改已有文件前备份到 D:/临时备份/NasDanmaku。
+正则只检查不超过 180 字的弹幕；错误写法会提示，修改后的正则匹配超时会停止，不会卡住一直等待。
 过滤发生在合成时，仅影响在线/XML/JSON 弹幕；原始缓存和台词不变，日志显示屏蔽数量。
 “弹幕设置”可调显示区域、字号、不透明度、速度及类型过滤；只影响弹幕，不改原台词字幕。
 勾选防挡字幕时，即使放大区域也会保留底部 32%；固定弹幕手动开启后同样限制在所选区域内。
-设置保留在当前窗口，重新启动恢复默认。调整后点确认合成，无需重新下载；已有 ASS 不会自动改变。
+字号、区域等显示设置和内置总开关保留在当前窗口，重启恢复默认；屏蔽规则列表会记住。
+调整后点确认合成，无需重新下载；已有 ASS 不会自动改变。
 手动导入的 ASS 已有排版，只支持时间偏移；要调整区域和字号请用在线弹幕或 XML/JSON。
 字幕与弹幕同属一条 ASS，播放时选择这条字幕即可。想仅看台词，选回原字幕轨。
 
@@ -1612,7 +1782,7 @@ def materialize_subtitle(choice, video, progress=None, duration=None):
 
 def synthesize(result, subtitle_index=0, offset=0, density=6, duration=8, font_size=32, progress=lambda _: None,
                *, area=25, opacity=80, block_scroll=False, block_fixed=True, block_color=False,
-               avoid_subtitles=True, deduplicate=True, block_noise=True, block_keywords=""):
+               avoid_subtitles=True, deduplicate=True, block_noise=True, block_keywords="", filter_rules=None):
     if not result.subtitles or not 0 <= subtitle_index < len(result.subtitles):
         raise ToolError("还没有可合成的文字字幕。")
     if not result.comments and result.dm_ass is None:
@@ -1638,7 +1808,8 @@ def synthesize(result, subtitle_index=0, offset=0, density=6, duration=8, font_s
         dm, filtered = render_comments(comments, base.resolution, offset, density, duration, font_size, progress=progress,
                                        area=area, opacity=opacity, block_scroll=block_scroll, block_fixed=block_fixed,
                                        block_color=block_color, avoid_subtitles=avoid_subtitles, deduplicate=deduplicate,
-                                       block_noise=block_noise, block_keywords=block_keywords, filter_stats=filter_stats)
+                                       block_noise=block_noise, block_keywords=block_keywords, filter_stats=filter_stats,
+                                       filter_rules=filter_rules)
         filtered += len(result.comments) - len(comments)
     progress("合并台词和弹幕")
     final = merge_ass(base, dm)
@@ -1739,6 +1910,205 @@ def progress_detail(update, elapsed):
     return detail + " · 本步已用 " + elapsed_text(elapsed)
 
 
+class FilterRulesDialog:
+    def __init__(self, parent):
+        self.parent = parent
+        self.rules = rules_with_keywords(parent.rule_rows, compile_block_keywords(parent.variables["block_keywords"].get()))
+        self.selected = None
+        self.current_part = None
+        self.window = tk.Toplevel(parent.window)
+        self.window.title("弹幕屏蔽规则 · 内置和自定义")
+        self.window.geometry("860x760")
+        self.window.minsize(780, 710)
+        frame = ttk.Frame(self.window, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="内置规则也能修改、停用或删除。普通关键词包含就屏蔽；正则用于匹配日期等写法规律。", wraplength=820).pack(anchor="w")
+        self.tree = ttk.Treeview(frame, columns=("enabled", "source", "name", "kind"), show="headings", height=6, selectmode="browse")
+        for key, label, width in (("enabled", "启用", 55), ("source", "来源", 65), ("name", "规则名称", 210), ("kind", "匹配方式", 330)):
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width, minwidth=45)
+        self.tree.pack(fill="x", pady=8)
+        self.tree.bind("<<TreeviewSelect>>", self.select_rule)
+        row = ttk.Frame(frame)
+        row.pack(fill="x")
+        ttk.Button(row, text="新增关键词", command=lambda: self.add_rule("keyword")).pack(side="left")
+        ttk.Button(row, text="新增正则", command=lambda: self.add_rule("search")).pack(side="left", padx=6)
+        ttk.Button(row, text="删除选中", command=self.delete_rule).pack(side="left")
+        ttk.Button(row, text="恢复全部默认", command=self.restore).pack(side="right")
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=8)
+        self.enabled = tk.BooleanVar()
+        self.name = tk.StringVar()
+        self.kind = tk.StringVar()
+        ttk.Checkbutton(row, text="启用此规则", variable=self.enabled).pack(side="left")
+        ttk.Entry(row, textvariable=self.name, width=25).pack(side="left", padx=6)
+        self.kind_box = ttk.Combobox(row, textvariable=self.kind, state="readonly", width=31)
+        self.kind_box.pack(side="left", fill="x", expand=True)
+        self.kind_box.bind("<<ComboboxSelected>>", self.change_kind)
+        ttk.Label(frame, text="用途说明（可修改）").pack(anchor="w")
+        self.description = tk.Text(frame, height=2, wrap="word", font=("Microsoft YaHei UI", 10))
+        self.description.pack(fill="x", pady=(2, 6))
+        self.example, self.keep_example = tk.StringVar(), tk.StringVar()
+        for label, variable in (("屏蔽示例", self.example), ("保留示例", self.keep_example)):
+            row = ttk.Frame(frame)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=label, width=10).pack(side="left")
+            ttk.Entry(row, textvariable=variable).pack(side="left", fill="x", expand=True)
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(8, 2))
+        ttk.Label(row, text="规则内容").pack(side="left")
+        self.part = tk.StringVar()
+        self.part_box = ttk.Combobox(row, textvariable=self.part, state="readonly", width=24)
+        self.part_box.pack(side="left", padx=8)
+        self.part_box.bind("<<ComboboxSelected>>", self.change_part)
+        ttk.Label(row, text="组合规则请逐项查看下拉列表", foreground="#606975").pack(side="left")
+        self.pattern = tk.Text(frame, height=4, wrap="word", font=("Consolas", 10))
+        self.pattern.pack(fill="both", expand=True)
+        ttk.Label(frame, text=r"正则小抄：\d 是数字；{4} 是重复四次；A|B 是 A 或 B。写普通词不用这些符号。" +
+                  "\n匹配忽略大小写、空格和常见简繁差异；整句正则还会去标点，正则只检查不超过 180 字的弹幕。",
+                  wraplength=820, foreground="#606975").pack(anchor="w", pady=6)
+        row = ttk.Frame(frame)
+        row.pack(fill="x")
+        self.sample = tk.StringVar()
+        ttk.Entry(row, textvariable=self.sample).pack(side="left", fill="x", expand=True)
+        self.test_button = ttk.Button(row, text="测试这句弹幕", command=self.test_sample)
+        self.test_button.pack(side="left", padx=(6, 0))
+        self.notice = tk.StringVar(value="测试按当前总开关和各条开关执行，显示命中的具体规则。示例只是说明，修改后请测试核对。")
+        ttk.Label(frame, textvariable=self.notice, wraplength=820).pack(anchor="w", pady=8)
+        row = ttk.Frame(frame)
+        row.pack(fill="x")
+        ttk.Label(row, text="保存后返回，再点“应用设置”；规则会保存在本机。", foreground="#606975").pack(side="left")
+        ttk.Button(row, text="保存规则", command=self.save).pack(side="right")
+        ttk.Button(row, text="取消", command=self.window.destroy).pack(side="right", padx=6)
+        self.refresh()
+
+    def flush(self):
+        if self.selected is None or self.selected >= len(self.rules):
+            return
+        item = self.rules[self.selected]
+        if self.current_part:
+            item["parts"][self.current_part] = self.pattern.get("1.0", "end-1c")
+        item.update(name=self.name.get().strip(), enabled=self.enabled.get(), description=self.description.get("1.0", "end-1c"),
+                    example=self.example.get(), keep_example=self.keep_example.get())
+        if self.tree.exists(str(self.selected)):
+            self.tree.item(str(self.selected), values=self.row_values(item))
+
+    @staticmethod
+    def row_values(item):
+        return ("是" if item["enabled"] else "否", "内置" if item["builtin"] else "自定义", item["name"], RULE_TYPES[item["kind"]])
+
+    def refresh(self, index=0):
+        self.selected, self.current_part = None, None
+        self.tree.delete(*self.tree.get_children())
+        for i, item in enumerate(self.rules):
+            self.tree.insert("", "end", iid=str(i), values=self.row_values(item))
+        if self.rules:
+            self.tree.selection_set(str(min(index, len(self.rules) - 1)))
+            self.select_rule()
+        else:
+            self.name.set("")
+            self.description.delete("1.0", "end")
+            self.pattern.delete("1.0", "end")
+            self.notice.set("列表已空：保存后不会有任何内置屏蔽；可新增规则或恢复默认。")
+
+    def select_rule(self, _=None):
+        selection = self.tree.selection()
+        if not selection or int(selection[0]) == self.selected:
+            return
+        self.flush()
+        self.selected = int(selection[0])
+        item = self.rules[self.selected]
+        self.enabled.set(item["enabled"])
+        self.name.set(item["name"])
+        simple = item["kind"] in ("keyword", "full", "search")
+        self.kind_box.configure(values=[RULE_TYPES[k] for k in (("keyword", "full", "search") if simple else (item["kind"],))])
+        self.kind.set(RULE_TYPES[item["kind"]])
+        self.description.delete("1.0", "end")
+        self.description.insert("1.0", item.get("description", ""))
+        self.example.set(item.get("example", ""))
+        self.keep_example.set(item.get("keep_example", ""))
+        self.sample.set(item.get("example", ""))
+        self.part_box.configure(values=[RULE_FIELD_LABELS[key] for key in RULE_FIELDS[item["kind"]]])
+        self.current_part = None
+        self.part_box.current(0)
+        self.change_part()
+
+    def change_part(self, _=None):
+        if self.selected is None:
+            return
+        item = self.rules[self.selected]
+        if self.current_part:
+            item["parts"][self.current_part] = self.pattern.get("1.0", "end-1c")
+        self.current_part = RULE_FIELDS[item["kind"]][self.part_box.current()]
+        self.pattern.delete("1.0", "end")
+        self.pattern.insert("1.0", item["parts"][self.current_part])
+
+    def change_kind(self, _=None):
+        if self.selected is None:
+            return
+        self.flush()
+        self.rules[self.selected]["kind"] = next(key for key, label in RULE_TYPES.items() if label == self.kind.get())
+        self.tree.item(str(self.selected), values=self.row_values(self.rules[self.selected]))
+
+    def add_rule(self, kind):
+        self.flush()
+        self.rules.append(dict(id=uuid.uuid4().hex, name="新关键词" if kind == "keyword" else "新正则", kind=kind,
+                               enabled=True, builtin=False, parts={"pattern": "示例关键词"},
+                               description="请填写要屏蔽的词或匹配规律。", example="示例关键词", keep_example="正常剧情讨论"))
+        self.refresh(len(self.rules) - 1)
+
+    def delete_rule(self):
+        if self.selected is not None:
+            index = self.selected
+            self.rules.pop(index)
+            self.refresh(index)
+
+    def restore(self):
+        self.rules = default_filter_rules()
+        self.refresh()
+
+    def test_sample(self):
+        self.flush()
+        try:
+            compile_filter_rules(self.rules)
+        except ToolError as exc:
+            self.notice.set(str(exc))
+            return
+        if not self.sample.get().strip():
+            self.notice.set("先输入一句要测试的弹幕。")
+            return
+        rows, sample, enabled = copy.deepcopy(self.rules), self.sample.get(), self.parent.variables["block_noise"].get()
+        results = queue.Queue()
+        self.test_button.configure(state="disabled")
+        self.notice.set("正在测试当前规则…")
+        def work():
+            try:
+                matches = evaluate_filter_rules([sample], rows, enabled, all_matches=True, timeout=3)[0]
+                results.put("会屏蔽，命中：" + "、".join(row["name"] for row in matches) if matches else "会保留：当前启用的规则均未命中。")
+            except Exception as exc:
+                results.put(str(exc))
+        def done():
+            try:
+                self.notice.set(results.get_nowait())
+                self.test_button.configure(state="normal")
+            except queue.Empty:
+                self.window.after(100, done)
+        threading.Thread(target=work, daemon=True).start()
+        self.window.after(100, done)
+
+    def save(self):
+        self.flush()
+        try:
+            compile_filter_rules(self.rules)
+        except ToolError as exc:
+            self.notice.set(str(exc))
+            return
+        self.parent.rule_rows = copy.deepcopy(self.rules)
+        self.parent.variables["block_keywords"].set("")
+        self.parent.keyword_button.configure(text=f"屏蔽规则 · {len(self.rules)} 条")
+        self.window.destroy()
+
+
 class DanmakuSettingsDialog:
     def __init__(self, app):
         self.app = app
@@ -1748,6 +2118,8 @@ class DanmakuSettingsDialog:
         frame = ttk.Frame(self.window, padding=12)
         frame.pack(fill="both", expand=True)
         current = app.render_settings
+        self.rule_rows = copy.deepcopy(current["filter_rules"] if current["filter_rules"] is not None else default_filter_rules())
+        self.rules_dialog = None
         self.variables = {key: tk.BooleanVar(value=current[key]) for key in
                           ("block_scroll", "block_fixed", "block_color", "avoid_subtitles", "deduplicate", "block_noise")}
         self.variables["block_keywords"] = tk.StringVar(value=current["block_keywords"])
@@ -1769,7 +2141,7 @@ class DanmakuSettingsDialog:
         row = ttk.Frame(frame)
         row.pack(fill="x", pady=(0, 4))
         ttk.Checkbutton(row, text="过滤垃圾弹幕（打卡、报时、闲聊等）", variable=self.variables["block_noise"]).pack(side="left")
-        self.keyword_button = ttk.Button(row, text="自定义屏蔽词…", command=self.edit_keywords)
+        self.keyword_button = ttk.Button(row, text="屏蔽规则（内置＋自定义）…", command=self.edit_keywords)
         self.keyword_button.pack(side="right")
         for key, label, low, high in (("area", "显示区域", 10, 100), ("opacity", "不透明度", 10, 100),
                                       ("font_size", "弹幕字号", 16, 64), ("speed", "弹幕速度", 50, 200)):
@@ -1796,38 +2168,20 @@ class DanmakuSettingsDialog:
         self.preview()
 
     def values(self):
-        settings = {key: self.variables[key].get() for key in DM_DEFAULTS if key != "duration"}
+        settings = {key: self.variables[key].get() for key in DM_DEFAULTS if key not in ("duration", "filter_rules")}
+        settings["filter_rules"] = copy.deepcopy(self.rule_rows)
         for key in ("area", "opacity", "font_size"):
             settings[key] = round(settings[key])
         settings["duration"] = 800 / finite(self.variables["speed"].get(), "速度")
         density = int(self.variables["density"].get())
         compile_block_keywords(settings["block_keywords"])
+        compile_filter_rules(settings["filter_rules"])
         return settings, density
 
     def edit_keywords(self):
-        win = tk.Toplevel(self.window)
-        win.title("自定义弹幕屏蔽词")
-        frame = ttk.Frame(win, padding=12)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="每行一个词，包含该词的整条弹幕将被屏蔽；按普通文字匹配，不用写正则。", wraplength=480).pack(anchor="w")
-        ttk.Label(frame, text="内置：日期/时间打卡、报几刷、陪谁看、在吗/有人吗、重复字符、广告引流。", wraplength=480).pack(anchor="w", pady=6)
-        editor = tk.Text(frame, width=54, height=10, wrap="word", font=("Microsoft YaHei UI", 10))
-        editor.pack(fill="both", expand=True)
-        editor.insert("1.0", self.variables["block_keywords"].get())
-        notice = tk.StringVar(value="最多 100 条，每条 80 字。当前窗口有效，返回后还需点“应用设置”。")
-        ttk.Label(frame, textvariable=notice, wraplength=480).pack(anchor="w", pady=8)
-        def save():
-            raw = editor.get("1.0", "end-1c")
-            try:
-                words = compile_block_keywords(raw)
-            except ToolError as exc:
-                notice.set(str(exc))
-                return
-            self.variables["block_keywords"].set(raw)
-            self.keyword_button.configure(text=f"自定义屏蔽词 · {len(words)} 条")
-            win.destroy()
-        ttk.Button(frame, text="确定", command=save).pack(side="right")
-        ttk.Button(frame, text="取消", command=win.destroy).pack(side="right", padx=6)
+        if self.rules_dialog and self.rules_dialog.window.winfo_exists():
+            return
+        self.rules_dialog = FilterRulesDialog(self)
 
     def preview(self):
         if not hasattr(self, "canvas"):
@@ -1848,7 +2202,7 @@ class DanmakuSettingsDialog:
             sample = [Comment(0, "上方滚动弹幕示意"), Comment(0, "弹幕字号与区域比例", 0x7ADDEF),
                       Comment(0, "顶部固定弹幕", mode=5), Comment(0, "底部固定弹幕（仍在显示区域内）", mode=4)]
             doc, _ = render_comments(sample, (1920, 1080), density=density,
-                                     **dict(settings, block_noise=False, block_keywords=""))
+                                     **dict(settings, block_noise=False, block_keywords="", filter_rules=[]))
             for number, row in enumerate(doc.events):
                 position = re.search(r"\\(?:move|pos)\([^,]+,([\d.]+)", row["Text"])
                 text_value = re.sub(r"\{[^}]*\}", "", row["Text"])
@@ -1867,11 +2221,12 @@ class DanmakuSettingsDialog:
 
     def reset(self):
         for key, value in DM_DEFAULTS.items():
-            if key != "duration":
+            if key not in ("duration", "filter_rules"):
                 self.variables[key].set(value)
+        self.rule_rows = default_filter_rules()
         self.variables["speed"].set(100)
         self.variables["density"].set("6")
-        self.keyword_button.configure(text="自定义屏蔽词…")
+        self.keyword_button.configure(text="屏蔽规则（内置＋自定义）…")
         self.preview()
 
     def apply(self):
@@ -1887,8 +2242,10 @@ class DanmakuSettingsDialog:
                 raise ToolError("滚动和固定不能同时屏蔽，否则没有弹幕可显示。")
             samples = [Comment(0, "检查滚动"), Comment(0, "检查固定", mode=5)]
             render_comments(samples, (1920, 1080), density=density,
-                            **dict(settings, block_noise=False, block_keywords=""))
-        except (ToolError, ValueError, tk.TclError, ZeroDivisionError) as exc:
+                            **dict(settings, block_noise=False, block_keywords="", filter_rules=[]))
+            if settings["filter_rules"] != self.app.render_settings["filter_rules"]:
+                save_filter_rules(settings["filter_rules"])
+        except (ToolError, ValueError, OSError, tk.TclError, ZeroDivisionError) as exc:
             self.note.set("请检查设置：" + str(exc))
             return
         self.app.render_settings = settings
@@ -1921,6 +2278,12 @@ class App:
         self.offset = tk.StringVar(value="0")
         self.density = tk.StringVar(value="6")
         self.render_settings = dict(DM_DEFAULTS)
+        rule_warning = ""
+        try:
+            self.render_settings["filter_rules"] = load_filter_rules()
+        except (ToolError, OSError) as exc:
+            self.render_settings["filter_rules"] = default_filter_rules()
+            rule_warning = f"读取已保存的屏蔽规则失败，暂用默认规则；原文件未改动。{exc}"
         self.platform = tk.StringVar(value="自动")
         self.platform_keys = [None]
         self.settings_dialog = None
@@ -2006,6 +2369,9 @@ class App:
         self.log_box.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         self.root.after(100, self.poll)
+        if rule_warning:
+            self.status.set(rule_warning)
+            self.log(rule_warning)
         if initial:
             self.root.after(200, self.scan)
 
@@ -2297,7 +2663,7 @@ class App:
 
     def show_output(self, value):
         self.log(f"台词 {value['subtitle_lines']} 行，弹幕 {value['danmaku_lines']} 条；过滤/去重/限流 {value['filtered']} 条。")
-        self.log(f"其中垃圾弹幕 {value.get('noise_filtered', 0)} 条，自定义屏蔽词 {value.get('keyword_filtered', 0)} 条。")
+        self.log(f"其中内置规则屏蔽 {value.get('noise_filtered', 0)} 条，自定义规则屏蔽 {value.get('keyword_filtered', 0)} 条。")
         if value.get("saved", True):
             self.pending_output = None
             self.status.set("合成完成，已保存到影片原目录。")
@@ -2321,6 +2687,16 @@ class App:
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv == ["--_filter-rules-worker"]:
+        try:
+            payload = json.loads(sys.stdin.buffer.read())
+            result = _evaluate_filter_rules(payload["texts"], payload["rules"], payload["enabled"], payload["all_matches"])
+            sys.stdout.buffer.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+        except Exception as exc:
+            sys.stderr.buffer.write(str(exc).encode("utf-8"))
+            return 1
+        return 0
     parser = argparse.ArgumentParser(description="选择影片→自动找字幕和弹幕→确认合成到原目录。单文件，无需 API 密钥。")
     parser.add_argument("video", nargs="?", help="可选：本地/可访问 NAS 影片路径")
     args = parser.parse_args(argv)
@@ -2330,4 +2706,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

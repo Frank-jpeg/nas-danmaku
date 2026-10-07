@@ -94,6 +94,7 @@ class CoreTests(unittest.TestCase):
             (root / "弹幕.xml").write_text(XML, encoding="utf-8")
             result = d.build(subtitle=root / "原字幕.srt", danmaku=root / "弹幕.xml", out_dir=root, name="电影")
             first = Path(result["output"])
+            self.assertEqual(first.name, "弹幕版-电影.ass")
             before = first.read_bytes()
             result2 = d.build(subtitle=root / "原字幕.srt", danmaku=root / "弹幕.xml", out_dir=root, name="电影", offset=5)
             self.assertTrue(result2["output"].endswith("-v2.ass"))

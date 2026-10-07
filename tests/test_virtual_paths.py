@@ -49,7 +49,7 @@ class VirtualPathTests(unittest.TestCase):
                  patch.object(d, 'fetch_public_danmaku', return_value=([d.Comment(2, '弹幕')], '测试源', '')):
                 result = d.scan_movie(video)
                 self.assertEqual(result.video, video)
-                self.assertFalse(list(folder.glob('*字幕加弹幕*')))
+                self.assertFalse(list(folder.glob('弹幕版-*.ass')))
                 output = d.synthesize(result)
             self.assertEqual(Path(output['output']).parent, folder)
             self.assertEqual(output['danmaku_lines'], 1)
@@ -65,7 +65,7 @@ class VirtualPathTests(unittest.TestCase):
             with patch.object(Path, 'resolve', side_effect=unsupported_volume()):
                 output = d.build(subtitle=subtitle, danmaku=comments, out_dir=folder, name='电影')
             self.assertTrue(Path(output['output']).is_file())
-            self.assertEqual(len(list(folder.glob('*字幕加弹幕*'))), 1)
+            self.assertEqual(len(list(folder.glob('弹幕版-*.ass'))), 1)
 
     def test_gui_generation_and_failed_scan_labels(self):
         try:

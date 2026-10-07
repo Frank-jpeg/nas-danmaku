@@ -31,7 +31,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
@@ -578,7 +578,7 @@ def build(subtitle=None, video=None, track=None, danmaku=None, out_dir=None, nam
         count = len(comments)
         extra, filtered = render_comments(comments, base.resolution, offset, density, duration, font_size)
     merged = merge_ass(base, extra)
-    path = save_new(Path(out_dir) / f"{name}-字幕加弹幕.ass", merged.dumps())
+    path = save_new(Path(out_dir) / f"弹幕版-{name}.ass", merged.dumps())
     return {"output": str(normalize_path(path)), "subtitle_lines": len(base.events), "danmaku_read": count,
             "danmaku_written": len(extra.events), "invalid_or_special": skipped,
             "filtered_or_over_limit": filtered, "warnings": warnings}
@@ -617,7 +617,7 @@ HOSTS = ("qq.com", "iqiyi.com", "bilibili.com", "youku.com", "mgtv.com")
 HELP = """字幕弹幕一键合成 v2（单文件）
 
 使用：选择影片 → 自动识别片名、字幕及弹幕 → 核对下面的结果 → 确认合成。
-输出：影片原目录 / 影片完整文件名-字幕加弹幕.ass。同名则自动加 -v2，不覆盖原文件。
+输出：影片原目录 / 弹幕版-影片完整文件名.ass。同名则自动加 -v2，不覆盖原文件。
 
 只需要这一个 .py；Python 3.10+（含 Tkinter）。读取影片信息和内封文字字幕需要先安装 ffprobe/ffmpeg，并确保可在命令行中运行。
 路径必须是 Windows 能读取的本地/映射盘/UNC 路径。极空间 App 里的虚拟路径或分享链接不能直接当文件路径。
@@ -1464,8 +1464,8 @@ def synthesize(result, subtitle_index=0, offset=0, density=8, duration=8, font_s
         filtered += len(result.comments) - len(comments)
     progress("合并台词和弹幕")
     final = merge_ass(base, dm)
-    target = result.video.with_name(result.video.stem + "-字幕加弹幕.ass")
-    output = save_new(result.workspace / "字幕加弹幕.ass", final.dumps(), progress, "在本机保存合成字幕")
+    target = result.video.with_name(f"弹幕版-{result.video.stem}.ass")
+    output = save_new(result.workspace / target.name, final.dumps(), progress, "在本机保存合成字幕")
     value = {"output": str(output), "local_output": str(output), "video": str(result.video),
              "signature": result.signature, "target": str(target), "subtitle_lines": len(base.events),
              "danmaku_lines": len(dm.events), "filtered": filtered}
@@ -1807,7 +1807,7 @@ class App:
             else:
                 self.movie.set("未匹配到电影（可以修正片名重查）")
             self.show_danmaku()
-            self.output_text.set("输出到：" + str(result.video.with_name(result.video.stem + "-字幕加弹幕.ass")))
+            self.output_text.set("输出到：" + str(result.video.with_name(f"弹幕版-{result.video.stem}.ass")))
             for warning in result.warnings:
                 self.log("提示：" + warning)
             self.log("本地缓存：" + str(result.workspace))
@@ -1912,7 +1912,7 @@ class App:
             self.pending_output = None
             self.status.set("合成完成，已保存到影片原目录。")
             self.output_text.set("已保存：" + value["output"])
-            messagebox.showinfo("合成完成", value["output"] + "\n\n在极影视中选择这条“字幕加弹幕”字幕即可。")
+            messagebox.showinfo("合成完成", value["output"] + "\n\n在极影视中选择这条以“弹幕版-”开头的字幕即可。")
         else:
             self.pending_output = value
             self.status.set("本机合成成功，NAS 写回未完成。恢复连接后点“重试写回 NAS”。")

@@ -73,7 +73,7 @@ class AutoTests(unittest.TestCase):
         self.assertEqual(d.identify_movie(self.video, '修正片名')['title'], '修正片名')
 
     def test_sidecar_only_exact_movie_not_danmaku(self):
-        for name in [self.video.stem + '.chs.srt', self.video.stem + '.eng.srt', self.video.stem + '-字幕加弹幕.ass', self.video.stem + '2.srt', '别的电影.srt']:
+        for name in [self.video.stem + '.chs.srt', self.video.stem + '.eng.srt', self.video.stem + '-字幕加弹幕.ass', '弹幕版-' + self.video.stem + '.ass', self.video.stem + '2.srt', '别的电影.srt']:
             (self.folder / name).write_text(SRT, encoding='utf-8')
         choices = d.sidecar_choices(self.video)
         self.assertEqual(len(choices), 2)
@@ -152,11 +152,13 @@ class AutoTests(unittest.TestCase):
         with patch.object(d, 'title_subtitles', return_value=[candidate]), patch.object(d, 'web_json', return_value=data), patch.object(d, 'fetch_public_danmaku', return_value=(comments, '测试源', 'https://v.qq.com/test')):
             result = d.scan_movie(self.video)
         self.assertEqual(result.subtitles[0].kind, 'online')
-        self.assertFalse(list(self.folder.glob('*字幕加弹幕*')), '确认前不能写输出')
+        self.assertFalse(list(self.folder.glob('弹幕版-*.ass')), '确认前不能写输出')
         before = self.video.read_bytes()
         output = d.synthesize(result)
         target = Path(output['output'])
         self.assertEqual(target.parent, self.video.parent)
+        self.assertEqual(target.name, f'弹幕版-{self.video.stem}.ass')
+        self.assertEqual(Path(output['local_output']).name, target.name)
         self.assertEqual(output['subtitle_lines'], 1)
         self.assertEqual(output['danmaku_lines'], 1)
         again = d.synthesize(result)
@@ -172,7 +174,7 @@ class AutoTests(unittest.TestCase):
         output = d.synthesize(result)
         self.assertFalse(output['saved'])
         self.assertIn('发生了变化', output['write_error'])
-        self.assertFalse(list(self.folder.glob('*字幕加弹幕*')))
+        self.assertFalse(list(self.folder.glob('弹幕版-*.ass')))
 
     def test_hidden_gui_analyze_confirm_and_stale_path(self):
         try:
@@ -196,7 +198,7 @@ class AutoTests(unittest.TestCase):
             app.scan();wait()
             self.assertEqual(app.title.get(),'流浪地球')
             self.assertEqual(str(app.generate_button['state']),'normal')
-            self.assertFalse(list(self.folder.glob('*字幕加弹幕*')))
+            self.assertFalse(list(self.folder.glob('弹幕版-*.ass')))
             app.generate();wait()
             self.assertEqual(alerts[-1][0],'合成完成')
             app.path.set(str(self.folder/'other.mkv'))

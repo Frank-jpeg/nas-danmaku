@@ -1,0 +1,41 @@
+# 本工作区的交付副本、试验材料与缓存
+/outputs/
+/work/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.DS_Store
+Thumbs.db
+
+# 本机配置和凭证
+.env
+.env.*
+!.env.example
+*.local.json
+*.local.toml
+*.pem
+*.key
+
+# 影片、字幕、真实接口响应和导出物均不进入源码仓库
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.m4v
+*.ts
+*.m2ts
+*.wmv
+*.webm
+*.ass
+*.ssa
+*.srt
+*.sup
+*.sub
+*.nfo
+*.zip
+*.log

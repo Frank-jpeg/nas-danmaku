@@ -1,0 +1,1225 @@
+#!/usr/bin/env python3
+"""字幕弹幕一键合成 v2：单文件，选择影片后自动识别字幕和弹幕，确认后写回原目录。"""
+from __future__ import annotations
+
+import argparse
+import base64
+import copy
+import hashlib
+import html
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+
+VERSION = "2.0.1"
+MAX_BYTES = 32 * 1024 * 1024
+STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
+EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
+TEXT_CODECS = {"ass", "ssa", "subrip", "srt", "mov_text", "text", "webvtt"}
+
+
+class ToolError(Exception):
+    pass
+
+
+def finite(value, label="数值"):
+    try:
+        result = float(value)
+    except (ValueError, TypeError) as exc:
+        raise ToolError(f"{label}必须是数字。") from exc
+    if not math.isfinite(result):
+        raise ToolError(f"{label}不能是无穷大或 NaN。")
+    return result
+
+
+def read_text(path):
+    path = Path(path)
+    if path.stat().st_size > MAX_BYTES:
+        raise ToolError("字幕/弹幕文件超过 32 MB，请先精简。")
+    raw = path.read_bytes()
+    encodings = ("utf-16",) if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else ("utf-8-sig", "gb18030")
+    for encoding in encodings:
+        try:
+            return raw.decode(encoding)
+        except UnicodeError:
+            continue
+    raise ToolError("无法读取文件编码，请将输入另存为 UTF-8。")
+
+
+def stamp(value):
+    match = re.fullmatch(r"\s*(\d+):(\d{2}):(\d{2})[.,](\d{1,3})\s*", value)
+    if not match:
+        raise ToolError(f"不支持的时间格式：{value!r}")
+    h, m, s, fraction = match.groups()
+    if int(m) > 59 or int(s) > 59:
+        raise ToolError("字幕时间的分钟/秒超出范围。")
+    return round((int(h) * 3600 + int(m) * 60 + int(s) + int(fraction) / 10 ** len(fraction)) * 100)
+
+
+def format_stamp(value):
+    value = max(0, int(value))
+    seconds, cs = divmod(value, 100)
+    minutes, sec = divmod(seconds, 60)
+    hours, minute = divmod(minutes, 60)
+    return f"{hours}:{minute:02}:{sec:02}.{cs:02}"
+
+
+def style(name="Default", size=48):
+    values = [name, "Microsoft YaHei", str(size), "&H00FFFFFF", "&H000000FF", "&H00000000", "&H00000000", "0", "0", "0", "0", "100", "100", "0", "0", "1", "2", "0", "2", "60", "60", "45", "1"]
+    return dict(zip(STYLE_FIELDS, values))
+
+
+def event(start, end, text, style_name="Default", layer=0):
+    return dict(zip(EVENT_FIELDS, [str(layer), format_stamp(start), format_stamp(end), style_name, "", "0", "0", "0", "", text]))
+
+
+@dataclass
+class Ass:
+    info: dict = field(default_factory=lambda: {"ScriptType": "v4.00+", "PlayResX": "1920", "PlayResY": "1080", "WrapStyle": "0", "ScaledBorderAndShadow": "yes"})
+    styles: dict = field(default_factory=dict)
+    events: list = field(default_factory=list)
+    extras: list = field(default_factory=list)
+
+    @property
+    def resolution(self):
+        try:
+            w, h = int(self.info["PlayResX"]), int(self.info["PlayResY"])
+        except (KeyError, ValueError) as exc:
+            raise ToolError("ASS 缺少有效的 PlayResX/PlayResY，无法安全合并坐标；请先补全画布分辨率。") from exc
+        if not (100 <= w <= 16384 and 100 <= h <= 16384):
+            raise ToolError("ASS 画布分辨率超出支持范围。")
+        return w, h
+
+    def dumps(self):
+        lines = ["[Script Info]"] + [f"{key}: {value}" for key, value in self.info.items()]
+        lines += ["", "[V4+ Styles]", "Format: " + ", ".join(STYLE_FIELDS)]
+        for row in self.styles.values():
+            lines.append("Style: " + ",".join(row[k] for k in STYLE_FIELDS))
+        lines += ["", "[Events]", "Format: " + ", ".join(EVENT_FIELDS)]
+        for row in sorted(self.events, key=lambda x: (stamp(x["Start"]), int(x["Layer"]))):
+            lines.append("Dialogue: " + ",".join(row[k] for k in EVENT_FIELDS))
+        for name, content in self.extras:
+            lines += ["", name] + content
+        return "\n".join(lines) + "\n"
+
+
+def parse_ass(text):
+    doc = Ass(info={})
+    section = ""
+    fields = []
+    info_names = {k.lower(): k for k in ("ScriptType", "PlayResX", "PlayResY", "WrapStyle", "ScaledBorderAndShadow")}
+    for number, raw in enumerate(text.lstrip("\ufeff").splitlines(), 1):
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section, fields = line.lower(), []
+            if section == "[v4 styles]":
+                raise ToolError("旧版 SSA 请先用 ffmpeg 转换成 ASS。")
+            if section not in {"[script info]", "[v4+ styles]", "[events]"}:
+                doc.extras.append((line, []))
+            continue
+        if section not in {"[script info]", "[v4+ styles]", "[events]"}:
+            if doc.extras:
+                doc.extras[-1][1].append(raw)
+            continue
+        if not line or line.startswith(";"):
+            continue
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        value = value.lstrip()
+        if section == "[script info]":
+            doc.info[info_names.get(key.strip().lower(), key.strip())] = value
+        elif key.lower() == "format":
+            standard = STYLE_FIELDS if section == "[v4+ styles]" else EVENT_FIELDS
+            mapping = {k.lower(): k for k in standard}
+            fields = [mapping.get(v.strip().lower(), v.strip()) for v in value.split(",")]
+            if not set(standard).issubset(fields) or len(set(fields)) != len(fields):
+                raise ToolError(f"ASS 第 {number} 行字段定义不完整或重复。")
+            if section == "[events]" and fields[-1] != "Text":
+                raise ToolError("ASS 的 Text 字段必须在最后。")
+        elif key.lower() in {"style", "dialogue"}:
+            if not fields:
+                raise ToolError(f"ASS 第 {number} 行之前缺少 Format。")
+            values = value.split(",", len(fields) - 1)
+            if len(values) != len(fields):
+                raise ToolError(f"ASS 第 {number} 行字段数量不正确。")
+            row = dict(zip(fields, values))
+            if section == "[v4+ styles]" and key.lower() == "style":
+                if row["Name"] in doc.styles:
+                    raise ToolError("输入 ASS 有重复样式名，请先修复。")
+                doc.styles[row["Name"]] = row
+            elif section == "[events]" and key.lower() == "dialogue":
+                if stamp(row["End"]) <= stamp(row["Start"]):
+                    raise ToolError(f"ASS 第 {number} 行结束时间不晚于开始时间。")
+                try:
+                    int(row["Layer"])
+                except ValueError as exc:
+                    raise ToolError("ASS Layer 必须是整数。") from exc
+                doc.events.append(row)
+    doc.resolution
+    if not doc.events:
+        raise ToolError("ASS 没有可显示的 Dialogue 行。")
+    if any(row["Style"] not in doc.styles for row in doc.events):
+        raise ToolError("ASS 有未定义的样式，请先修复。")
+    return doc
+
+
+def escape_text(text):
+    # 弹幕是文本，绝不允许把其中的 ASS 标签当作代码执行。
+    text = " ".join(str(text).split())
+    text = "".join(c for c in text if unicodedata.category(c) != "Cc")
+    return text.replace("\\", "＼").replace("{", "｛").replace("}", "｝")
+
+
+def srt_text(text):
+    parts = re.split(r"(<[^>]+>|\r?\n)", text)
+    out = []
+    for part in parts:
+        tag = part.lower()
+        if tag in {"<i>", "<b>", "<u>"}:
+            out.append("{\\" + tag[1] + "1}")
+        elif tag in {"</i>", "</b>", "</u>"}:
+            out.append("{\\" + tag[2] + "0}")
+        elif tag in {"<br>", "<br/>", "<br />", "\n", "\r\n"}:
+            out.append(r"\N")
+        elif not tag.startswith("<"):
+            out.append(html.unescape(part).replace("\\", "＼").replace("{", "｛").replace("}", "｝"))
+    return "".join(out)
+
+
+def parse_srt(text):
+    doc = Ass(styles={"Default": style()})
+    for block in re.split(r"\n\s*\n", text.lstrip("\ufeff").replace("\r\n", "\n").strip()):
+        lines = block.splitlines()
+        if lines and lines[0].strip().isdigit():
+            lines.pop(0)
+        if not lines:
+            continue
+        match = re.fullmatch(r"\s*(\d+:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d+:\d{2}:\d{2}[,.]\d{1,3})\s*", lines[0])
+        if not match or len(lines) < 2:
+            raise ToolError("SRT 存在无法解析的字幕块，请检查时间行或另存为 ASS。")
+        start, end = map(stamp, match.groups())
+        if end <= start:
+            raise ToolError("SRT 结束时间必须晚于开始时间。")
+        doc.events.append(event(start, end, srt_text("\n".join(lines[1:]))))
+    if not doc.events:
+        raise ToolError("SRT 没有字幕内容。")
+    return doc
+
+
+def load_subtitle(path):
+    suffix = Path(path).suffix.lower()
+    if suffix == ".srt":
+        return parse_srt(read_text(path))
+    if suffix == ".ass":
+        return parse_ass(read_text(path))
+    raise ToolError("原字幕请选择 .srt 或 .ass。PGS/SUP 图片字幕需要先 OCR 或找文字字幕。")
+
+
+def run_media(name, args, timeout=300):
+    executable = shutil.which(name)
+    if not executable:
+        raise ToolError(f"没有找到 {name}。请安装 FFmpeg 并加入 PATH，或直接使用外挂 SRT/ASS。")
+    try:
+        result = subprocess.run([executable, "-v", "error", "-nostdin"] + args if name == "ffmpeg" else [executable, "-v", "error"] + args,
+                                capture_output=True, timeout=timeout,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired as exc:
+        raise ToolError("读取影片超时；异地影片建议先取出文字字幕，再导入本工具。") from exc
+    if result.returncode:
+        message = result.stderr.decode("utf-8", errors="replace")[-1500:]
+        raise ToolError(f"{name} 失败：{message}")
+    return result.stdout
+
+
+def subtitle_tracks(video):
+    if not Path(video).is_file():
+        raise ToolError("影片路径不存在或当前无法访问。")
+    data = json.loads(run_media("ffprobe", ["-show_streams", "-of", "json", str(video)], timeout=60))
+    return [s for s in data.get("streams", []) if s.get("codec_type") == "subtitle"]
+
+
+def extract_subtitle(video, index):
+    tracks = subtitle_tracks(video)
+    if index is None:
+        text_tracks = [s for s in tracks if s.get("codec_name") in TEXT_CODECS]
+        if len(text_tracks) != 1:
+            raise ToolError("影片有多个文字字幕轨或没有文字字幕轨；请先列出字幕轨并指定序号。")
+        index = text_tracks[0]["index"]
+    selected = next((s for s in tracks if s["index"] == int(index)), None)
+    if not selected or selected.get("codec_name") not in TEXT_CODECS:
+        raise ToolError("所选轨道不是支持的文字字幕。PGS/SUP/DVD 图片字幕请先 OCR 或找文字字幕。")
+    raw = run_media("ffmpeg", ["-i", str(video), "-map", f"0:{index}", "-c:s", "ass", "-f", "ass", "pipe:1"])
+    return parse_ass(raw.decode("utf-8-sig"))
+
+
+@dataclass
+class Comment:
+    time: float
+    text: str
+    color: int = 16777215
+    mode: int = 1
+
+
+def parse_comments(text):
+    comments, skipped = [], 0
+    clean = text.lstrip("\ufeff \t\r\n")
+    if clean.startswith("<"):
+        if "<!DOCTYPE" in clean.upper() or "<!ENTITY" in clean.upper():
+            raise ToolError("不支持包含外部实体声明的 XML。")
+        try:
+            root = ET.fromstring(clean)
+        except ET.ParseError as exc:
+            raise ToolError("弹幕 XML 格式不正确。") from exc
+        rows = [{"p": node.attrib.get("p", ""), "m": "".join(node.itertext()), "xml": True} for node in root.iter("d")]
+    else:
+        try:
+            obj = json.loads(clean)
+        except json.JSONDecodeError as exc:
+            raise ToolError("弹幕文件不是有效的 XML/JSON。") from exc
+        if isinstance(obj, dict) and obj.get("success") is False:
+            raise ToolError("弹幕 JSON 是接口错误响应，不含有效弹幕。")
+        rows = obj.get("comments", obj.get("data", [])) if isinstance(obj, dict) else obj
+        if not isinstance(rows, list):
+            raise ToolError("JSON 需要弹弹play comments 数组或 time/text 对象数组。")
+    for row in rows:
+        try:
+            if not isinstance(row, dict):
+                raise ValueError()
+            if "p" in row:
+                p = str(row["p"]).split(",")
+                at, mode = finite(p[0]), int(p[1])
+                color = int(p[3] if row.get("xml") or len(p) >= 8 else p[2])
+                message = row.get("m", row.get("text", ""))
+            else:
+                at, mode = finite(row["time"]), int(row.get("mode", 1))
+                color = int(row.get("color", 16777215))
+                message = row.get("text", row.get("m", ""))
+            if mode not in (1, 2, 3, 4, 5, 6) or at < 0 or not str(message).strip():
+                raise ValueError()
+            comments.append(Comment(at, str(message), color & 0xFFFFFF, mode))
+        except (ValueError, TypeError, KeyError, IndexError, ToolError):
+            skipped += 1
+    if not comments:
+        raise ToolError("没有读到普通/顶部/底部弹幕，可能源站没有弹幕或格式不受支持。")
+    return comments, skipped
+
+
+def render_comments(comments, resolution, offset=0, density=8, duration=8, font_size=44):
+    width, height = resolution
+    offset, duration, font_size = finite(offset, "弹幕偏移"), finite(duration, "滚动时长"), finite(font_size, "字号")
+    if not 1 <= int(density) <= 30 or not 2 <= duration <= 20 or not 16 <= font_size <= 100:
+        raise ToolError("同屏条数范围 1–30，滚动时长 2–20 秒，字号 16–100（以 1080p 为基准）。")
+    size = font_size * height / 1080
+    top, row_height = max(8, height * .035), size * 1.45
+    lanes = min(int(density), max(1, int((height * .68 - top) / row_height)))
+    available = [-1.0] * lanes
+    doc = Ass(styles={"Scroll": style("Scroll", round(size, 2))})
+    doc.info.update(PlayResX=str(width), PlayResY=str(height), WrapStyle="2")
+    doc.styles["Scroll"].update(Alignment="7", Outline=str(round(max(1, size / 22), 2)), MarginL="0", MarginR="0", MarginV="0")
+    seen, omitted = {}, 0
+    for comment in sorted(comments, key=lambda x: x.time):
+        at = comment.time + offset
+        message = escape_text(comment.text)[:120]
+        if at < 0 or (message in seen and at - seen[message] < 15):
+            omitted += 1
+            continue
+        lane = next((i for i, end in enumerate(available) if end <= at), None)
+        if lane is None:
+            omitted += 1
+            continue
+        seen[message] = at
+        available[lane] = at + duration
+        # 独占滚动行直到出屏，防止后发长弹幕追撞；底部 32% 留给台词。
+        units = sum(1 if unicodedata.east_asian_width(c) in "WF" else .65 for c in message)
+        length = max(size, units * size * 1.2)
+        color = comment.color
+        bgr = f"{color & 255:02X}{color >> 8 & 255:02X}{color >> 16 & 255:02X}"
+        y = top + lane * row_height
+        tags = f"{{\\an7\\q2\\move({width + 10},{y:.2f},{-length:.2f},{y:.2f})\\c&H{bgr}&}}"
+        doc.events.append(event(round(at * 100), round((at + duration) * 100), tags + message, "Scroll"))
+    if not doc.events:
+        raise ToolError("偏移/过滤后没有可显示的弹幕，请调整参数。")
+    return doc, omitted
+
+
+def shift_events(doc, seconds, is_danmaku=False):
+    delta = round(finite(seconds, "时间偏移") * 100)
+    rows = []
+    for row in doc.events:
+        start, end = stamp(row["Start"]) + delta, stamp(row["End"]) + delta
+        if end <= 0 or (is_danmaku and start < 0):
+            continue
+        row["Start"], row["End"] = format_stamp(start), format_stamp(end)
+        rows.append(row)
+    doc.events = rows
+
+
+def rename_styles(doc, prefix):
+    mapping = {name: f"{prefix}{i}" for i, name in enumerate(doc.styles)}
+    original_default = mapping.get("Default")
+    for row in doc.styles.values():
+        row["Name"] = mapping[row["Name"]]
+    doc.styles = {row["Name"]: row for row in doc.styles.values()}
+    for row in doc.events:
+        row["Style"] = mapping[row["Style"]]
+        def block(match):
+            def reset(found):
+                old = found[1]
+                if not old:
+                    return r"\r"
+                if old not in mapping:
+                    if original_default is None:
+                        raise ToolError(f"ASS 行内样式重置引用了不存在的样式：{old}")
+                    return r"\r" + original_default
+                return r"\r" + mapping[old]
+            return re.sub(r"\\r([^\\}]*)", reset, match[0])
+        row["Text"] = re.sub(r"\{[^}]*\}", block, row["Text"])
+
+
+def merge_ass(subtitles, danmaku):
+    base, extra = copy.deepcopy(subtitles), copy.deepcopy(danmaku)
+    if base.resolution != extra.resolution:
+        raise ToolError(f"两份 ASS 的画布不同：原字幕 {base.resolution}，弹幕 {extra.resolution}。请改用 XML/JSON 弹幕，工具会按原字幕画布生成；不会擅自缩放已有 ASS 特效。")
+    if not base.events or not extra.events:
+        raise ToolError("原字幕或弹幕在偏移后为空，未生成文件。")
+    rename_styles(base, "SUB_")
+    rename_styles(extra, "DM_")
+    minimum = min(int(row["Layer"]) for row in base.events)
+    for row in base.events:
+        row["Layer"] = str(int(row["Layer"]) - minimum)
+    ceiling = max(int(row["Layer"]) for row in base.events) + 1
+    minimum_dm = min(int(row["Layer"]) for row in extra.events)
+    for row in extra.events:
+        row["Layer"] = str(int(row["Layer"]) - minimum_dm + ceiling)
+        # base WrapStyle 属于原字幕；给弹幕独立设置 q，避免自动折行。
+        row["Text"] = r"{\q2}" + row["Text"]
+    base.styles.update(extra.styles)
+    base.events.extend(extra.events)
+    base.info["Title"] = "字幕加弹幕 · generated by danmaku_tool " + VERSION
+    # 原字幕附件/字体保留；弹幕字体若使用外部字体需在播放设备安装。
+    return base
+
+
+def save_new(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for version in range(1, 10000):
+        candidate = path if version == 1 else path.with_name(f"{path.stem}-v{version}{path.suffix}")
+        try:
+            with candidate.open("x", encoding="utf-8", newline="\n") as stream:
+                stream.write(text)
+            return candidate
+        except FileExistsError:
+            continue
+    raise ToolError("同名版本文件过多，请换一个输出目录。")
+
+
+def safe_name(name):
+    name = str(name).strip()
+    if not name or name in {".", ".."} or re.search(r'[<>:"/\\|?*\x00-\x1f]', name) or name.endswith((" ", ".")):
+        raise ToolError("电影名只填文件名（不含路径），不能包含 / \\ : 等字符。")
+    if re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", name):
+        raise ToolError("电影名不能使用 Windows 保留名称。")
+    return name
+
+
+def build(subtitle=None, video=None, track=None, danmaku=None, out_dir=None, name=None,
+          offset=0, subtitle_offset=0, density=8, duration=8, font_size=44):
+    if bool(subtitle) == bool(video):
+        raise ToolError("请选择一份原字幕，或一部用于提取字幕的影片。")
+    if not danmaku or not out_dir:
+        raise ToolError("请选择弹幕文件和输出目录。")
+    name = safe_name(name or Path(video or subtitle).stem)
+    base = load_subtitle(subtitle) if subtitle else extract_subtitle(video, track)
+    shift_events(base, subtitle_offset)
+    warnings = []
+    if Path(danmaku).suffix.lower() == ".ass":
+        extra = parse_ass(read_text(danmaku))
+        count, skipped, filtered = len(extra.events), 0, 0
+        shift_events(extra, offset, is_danmaku=True)
+        warnings.append("已有 ASS 弹幕保留原字号、密度和位置，仅应用时间偏移；请自行确认不会挡住台词。")
+    else:
+        comments, skipped = parse_comments(read_text(danmaku))
+        count = len(comments)
+        extra, filtered = render_comments(comments, base.resolution, offset, density, duration, font_size)
+    merged = merge_ass(base, extra)
+    path = save_new(Path(out_dir) / f"{name}-字幕加弹幕.ass", merged.dumps())
+    return {"output": str(path.resolve()), "subtitle_lines": len(base.events), "danmaku_read": count,
+            "danmaku_written": len(extra.events), "invalid_or_special": skipped,
+            "filtered_or_over_limit": filtered, "warnings": warnings}
+
+
+class SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+        if new.scheme not in {"http", "https"} or (old.scheme == "https" and new.scheme != "https"):
+            raise ToolError("接口跳转到不安全协议，已停止。")
+        result = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if result and (old.scheme, old.netloc) != (new.scheme, new.netloc):
+            for key in list(result.headers):
+                if key.lower() not in {"user-agent", "accept"}:
+                    del result.headers[key]
+        return result
+
+
+
+# ---- 单片自动识别与公开弹幕源 ----
+import concurrent.futures
+import difflib
+import gzip
+import queue
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+PUBLIC_DANMAKU = "https://dmku.hls.one/"
+PUBLIC_DANMAKU_BACKUP = "https://danmu.zxz.ee/"
+SHOOTER_API = "https://www.shooter.cn/api/subapi.php"
+KAN_SEARCH = "https://api.so.360kan.com/index"
+PLATFORMS = {"qq": "腾讯视频", "qiyi": "爱奇艺", "bilibili1": "哔哩哔哩", "youku": "优酷", "imgo": "芒果TV"}
+HOSTS = ("qq.com", "iqiyi.com", "bilibili.com", "youku.com", "mgtv.com")
+HELP = """字幕弹幕一键合成 v2（单文件）
+
+使用：选择影片 → 自动识别片名、字幕及弹幕 → 核对下面的结果 → 确认合成。
+输出：影片原目录 / 影片完整文件名-字幕加弹幕.ass。同名则自动加 -v2，不覆盖原文件。
+
+只需要这一个 .py；Python 3.10+（含 Tkinter）。读取影片信息和内封文字字幕需要先安装 ffprobe/ffmpeg，并确保可在命令行中运行。
+路径必须是 Windows 能读取的本地/映射盘/UNC 路径。极空间 App 里的虚拟路径或分享链接不能直接当文件路径。
+
+自动字幕：同目录匹配字幕 → 内封文字轨 → 射手按影片四段指纹搜索。
+若只有 PGS/SUP 图片字幕且在线未找到文字字幕，会明确提示；本工具不做 OCR、不假装已成功。
+提取内封字幕可能需扫描影片；异地 NAS 的耗时取决于网络。识别阶段只探测轨道，点击合成后才提取。
+
+弹幕：按片名通过 360 影视查找电影平台链接，再向公开弹幕库按需请求；不需要你填密钥。
+公开服务： https://dmku.hls.one/ ；备用 https://danmu.zxz.ee/ 。
+字幕协议： https://www.shooter.cn/api/subapi.php （https://github.com/qzane/SPlayerSubDownloader 中有协议说明）。
+这些外部服务可能变更/限流、没有某部电影的数据。失败会显示原因，支持修改片名重新识别或手动补选文件。
+只发送查询片名、影片文件名/四段 MD5 和公开平台链接；不上传电影、原台词内容、NAS 目录或账号。
+
+识别结果需核对片名、年份、时长，平台上架年份有时与上映年不同。
+弹幕偏移：正数延后、负数提前。不同剪辑版本可能无法只用一个偏移完全对齐。
+字幕默认保留原样式；XML/JSON 弹幕重排，底部 32% 留给台词，最多 8 条同时滚动。
+字幕与弹幕同属一条 ASS，播放时选择这条字幕即可。想仅看台词，选回原字幕轨。
+
+双击 .py 或运行 python 字幕弹幕一键合成_v2.py；也可把影片路径作为第一个参数传入。
+"""
+
+
+def web_bytes(url, data=None, timeout=25):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ToolError("服务返回了无效的下载链接。")
+    headers = {"User-Agent": "Mozilla/5.0 SubtitleDanmaku/2.0", "Accept-Encoding": "identity"}
+    if data is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.build_opener(SafeRedirect()).open(req, timeout=timeout) as response:
+            raw = response.read(MAX_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raise ToolError(f"{parsed.hostname} 返回 HTTP {exc.code}，服务暂不可用。") from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise ToolError(f"连接 {parsed.hostname} 失败或超时。") from None
+    if len(raw) > MAX_BYTES:
+        raise ToolError("服务返回超过 32 MB，已停止。")
+    return raw
+
+
+def web_json(url, data=None):
+    try:
+        return json.loads(web_bytes(url, data).decode("utf-8-sig"))
+    except (UnicodeError, ValueError):
+        raise ToolError("在线服务返回内容不是有效 JSON。") from None
+
+
+def normalize_title(text):
+    return "".join(c for c in unicodedata.normalize("NFKC", html.unescape(str(text))).casefold() if c.isalnum())
+
+
+def filename_title(stem):
+    # 先切除技术参数，再寻找上映年份；保留 1917、2012 这样的数字片名。
+    text = re.sub(r"(?i)[. _\-]+(?:2160p|1080[pi]|720p|480p|4k|8k|blu[ ._-]?ray|bdrip|brrip|web[ ._-]?dl|webrip|hdtv|remux|x26[45]|h[ .]?26[45]|hevc|avc|dvdrip)\b.*", "", stem)
+    years = list(re.finditer(r"(?<!\d)((?:18|19|20)\d{2})(?!\d)", text))
+    year = ""
+    for match in years:
+        prefix = text[:match.start()].strip(" ._-([{")
+        if prefix:
+            year = match[1]
+            text = prefix
+            break
+    text = re.sub(r"\[[^\]]*\]", lambda m: m[0][1:-1] if re.search(r"[\u4e00-\u9fff]", m[0]) else " ", text)
+    text = re.sub(r"(?i)\b(?:extended|remastered|unrated|directors?\s*cut|repack|proper)\b", " ", text)
+    text = re.sub(r"[._]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -_()[]{}")
+    return text or stem, year
+
+
+def identify_movie(video, override=""):
+    video = Path(video)
+    title, year = filename_title(video.stem)
+    source = "文件名"
+    nfo = video.with_suffix(".nfo")
+    if not nfo.is_file():
+        possible = video.parent / "movie.nfo"
+        if possible.is_file():
+            movies = [p for p in video.parent.iterdir() if p.suffix.lower() in {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".ts"}]
+            if len(movies) == 1:
+                nfo = possible
+    if nfo.is_file():
+        try:
+            text = read_text(nfo)
+            if "<!DOCTYPE" in text.upper() or "<!ENTITY" in text.upper():
+                raise ValueError()
+            root = ET.fromstring(text)
+            nfo_title = root.findtext("title")
+            if nfo_title:
+                title = nfo_title.strip()
+                year = (root.findtext("year") or year).strip()
+                source = "影片 NFO"
+        except (OSError, ValueError, ET.ParseError, ToolError):
+            pass
+    if override.strip():
+        title = override.strip()
+        source = "修正片名"
+    return {"title": title, "year": year, "source": source}
+
+
+def inspect_video(video):
+    video = Path(video)
+    if not video.is_file():
+        raise ToolError("影片路径当前不可访问。NAS 盘请先在文件资源管理器里打开并登录，然后重试。")
+    if video.suffix.lower() not in {".mkv", ".mp4", ".m4v", ".mov", ".avi", ".ts", ".m2ts", ".wmv", ".webm"}:
+        raise ToolError("请选择常见影片文件，例如 MKV/MP4；不支持把网页分享链接当作文件路径。")
+    meta = json.loads(run_media("ffprobe", ["-show_streams", "-show_format", "-of", "json", str(video)], timeout=60))
+    return meta
+
+
+@dataclass
+class SubtitleChoice:
+    label: str
+    kind: str
+    score: int = 0
+    path: str = ""
+    index: int | None = None
+    doc: Ass | None = None
+    delay: float = 0
+
+
+def language_score(text):
+    low = text.lower()
+    if re.search(r"(?i)(?:\b(?:zh|zho|chi|chs|cht|zh-cn|zh-tw)\b|中文|简体|繁体|中英|双语|chinese)", low):
+        score = 100
+    elif re.search(r"(?i)(?:\b(?:eng|en|english|jpn|japanese|kor|korean)\b|英文|日语|韩语)", low):
+        score = 10
+    else:
+        score = 50
+    if any(word in low for word in ("forced", "强制", "commentary", "评论")):
+        score -= 20
+    return score
+
+
+def sidecar_choices(video):
+    video = Path(video)
+    choices = []
+    for path in video.parent.iterdir():
+        if path.suffix.lower() not in {".ass", ".srt"} or not path.is_file():
+            continue
+        if re.search(r"(?i)(字幕加弹幕|弹幕|danmaku|danmu)", path.stem):
+            continue
+        suffix = path.stem[len(video.stem):] if path.stem.casefold().startswith(video.stem.casefold()) else None
+        if suffix is None or (suffix and suffix[0] not in " ._-(["):  # Movie2 不能当 Movie 的字幕
+            continue
+        score = language_score(suffix) + 15
+        choices.append(SubtitleChoice("外挂 · " + path.name, "file", score, str(path)))
+    return sorted(choices, key=lambda c: -c.score)
+
+
+def embedded_choices(meta):
+    choices = []
+    for stream in meta.get("streams", []):
+        if stream.get("codec_type") != "subtitle" or stream.get("codec_name") not in TEXT_CODECS:
+            continue
+        tags = stream.get("tags", {})
+        language = tags.get("language", "未标注语言")
+        title = tags.get("title", "")
+        score = language_score(language + " " + title)
+        if stream.get("disposition", {}).get("forced"):
+            score -= 20
+        label = f"内封 · #{stream['index']} · {language} · {stream.get('codec_name')} · {title}"
+        choices.append(SubtitleChoice(label, "embedded", score, index=int(stream["index"])))
+    return sorted(choices, key=lambda c: -c.score)
+
+
+def shooter_hash(video):
+    size = Path(video).stat().st_size
+    if size < 12288:
+        raise ToolError("影片太小，无法计算在线字幕指纹。")
+    chunks = []
+    with Path(video).open("rb") as source:
+        for position in (4096, (size // 3) * 2, size // 3, size - 8192):
+            source.seek(position)
+            chunks.append(hashlib.md5(source.read(4096)).hexdigest())
+    return ";".join(chunks)
+
+
+def decode_subtitle(raw):
+    if raw.startswith(b"\x1f\x8b"):
+        import io
+        with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
+            raw = stream.read(MAX_BYTES + 1)
+    if len(raw) > MAX_BYTES:
+        raise ToolError("在线字幕解压后超过大小限制。")
+    encodings = ("utf-16",) if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else ("utf-8-sig", "gb18030")
+    for encoding in encodings:
+        try:
+            return raw.decode(encoding)
+        except UnicodeError:
+            pass
+    raise ToolError("在线字幕编码无法识别。")
+
+
+def online_subtitles(video):
+    # 仅提交四个块的 MD5 和文件名，不提交 NAS 目录，也不上传原文件。
+    payload = urllib.parse.urlencode({"filehash": shooter_hash(video), "pathinfo": Path(video).name, "format": "json", "lang": "Chn"}).encode()
+    raw = web_bytes(SHOOTER_API, data=payload)
+    if raw.strip() in {b"\xff", b"-1", b"[]", b""}:
+        return []
+    try:
+        rows = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeError, ValueError):
+        raise ToolError("在线字幕源返回了无法识别的响应。") from None
+    if not isinstance(rows, list):
+        raise ToolError("在线字幕源格式发生变化。")
+    choices = []
+    for row in rows[:3]:
+        for file in row.get("Files", []):
+            ext = str(file.get("Ext", "")).lower().lstrip(".")
+            if ext not in {"srt", "ass"}:
+                continue
+            try:
+                text = decode_subtitle(web_bytes(file["Link"]))
+                doc = parse_srt(text) if ext == "srt" else parse_ass(text)
+                label = "在线匹配 · 射手 · " + (str(row.get("Desc", ""))[:90] or ext.upper())
+                choices.append(SubtitleChoice(label, "online", 95, doc=doc, delay=finite(row.get("Delay", 0), "字幕延迟") / 1000))
+            except (ToolError, KeyError, ValueError):
+                continue
+    return choices
+
+
+def discover_subtitles(video, meta, progress):
+    choices = sidecar_choices(video) + embedded_choices(meta)
+    warnings = []
+    # 内封中文字幕存在时不请求网络字幕；英语/未知语言仍尝试找到匹配的中文。
+    if not choices or max(c.score for c in choices) < 90:
+        progress("正在按影片指纹查找在线中文字幕…")
+        try:
+            choices += online_subtitles(video)
+        except ToolError as exc:
+            warnings.append(str(exc))
+    choices.sort(key=lambda c: -c.score)
+    if not choices:
+        image = any(s.get("codec_type") == "subtitle" for s in meta.get("streams", []))
+        warnings.append("仅检测到图片字幕，在线没有匹配的文字字幕。需要 OCR 或补选文字字幕。" if image else "影片没有可用文字字幕，在线也未找到；可以补选一份原台词 SRT/ASS。")
+    return choices, warnings
+
+
+def search_movies(title, year=""):
+    queries = [title]
+    # 英文片名先找中文别名，有助于匹配国内平台；失败继续原片名。
+    if not re.search(r"[\u4e00-\u9fff]", title):
+        try:
+            suggestions = web_json("https://movie.douban.com/j/subject_suggest?" + urllib.parse.urlencode({"q": title}))
+            if isinstance(suggestions, list):
+                match = next((r for r in suggestions if str(r.get("year", "")) == str(year)), suggestions[0] if suggestions else None)
+                if match and match.get("title"):
+                    queries.insert(0, match["title"])
+        except ToolError:
+            pass
+    results = []
+    for query in dict.fromkeys(queries):
+        data = web_json(KAN_SEARCH + "?" + urllib.parse.urlencode({"force_v": 1, "kw": query, "pageno": 1, "v_ap": 1, "tab": "all"}))
+        body = (data.get("data") or {}) if isinstance(data, dict) else {}
+        rows = (body.get("longData") or {}).get("rows") or []
+        for row in rows:
+            if str(row.get("cat_id")) != "1" or not row.get("playlinks"):
+                continue
+            found = html.unescape(re.sub(r"<[^>]+>", "", row.get("titleTxt") or row.get("title", "")))
+            a, b = normalize_title(found), normalize_title(query)
+            aliases = [normalize_title(x) for x in re.split(r"[/|;]", row.get("titlealias", "")) if x]
+            similarity = max([difflib.SequenceMatcher(None, a, b).ratio()] + [difflib.SequenceMatcher(None, alias, b).ratio() for alias in aliases])
+            if similarity < .58:
+                continue
+            score = similarity * 100
+            found_year = str(row.get("year", ""))
+            if year and found_year:
+                score += 15 if year == found_year else -min(25, abs(int(year) - int(found_year)) * 8) if year.isdigit() and found_year.isdigit() else -15
+            links = {k: v for k, v in row["playlinks"].items() if k in PLATFORMS and isinstance(v, str)}
+            if links:
+                results.append({"title": found, "year": found_year, "links": links, "score": score,
+                                "duration": row.get("coverInfo", {}).get("duration", ""), "id": row.get("en_id", "")})
+        if results:
+            break
+    return sorted(results, key=lambda r: -r["score"])[:8]
+
+
+def canonical_platform_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or not any(host == h or host.endswith("." + h) for h in HOSTS):
+        raise ToolError("未识别的影片平台链接。")
+    # 优酷 video?vid= 必须保留 vid；去掉广告跟踪参数。
+    query = urllib.parse.urlencode({k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items() if k in {"vid", "id", "cid", "bvid"}})
+    return urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path, query, ""))
+
+
+def parse_public_comments(data):
+    if not isinstance(data, dict) or data.get("code") != 23:
+        raise ToolError("公开弹幕源未返回有效弹幕。")
+    rows = data.get("danmuku", [])
+    comments = []
+    for row in rows:
+        try:
+            if not isinstance(row, list) or len(row) < 5:
+                continue
+            message = str(row[4])
+            if re.search(r"有\s*\d+\s*条弹幕列队来袭", message):
+                continue
+            color = str(row[2] or "#ffffff").lstrip("#")
+            if len(color) == 3:
+                color = "".join(c * 2 for c in color)
+            color_int = int(color, 16) if re.fullmatch(r"[0-9a-fA-F]{6}", color) else 16777215
+            at = finite(row[0])
+            if at >= 0 and message.strip():
+                comments.append(Comment(at, message, color_int, 1))
+        except (ValueError, TypeError, ToolError):
+            continue
+    if not comments:
+        raise ToolError("该片源暂无可用弹幕。")
+    return comments
+
+
+def fetch_public_danmaku(movie, progress, platform=None):
+    errors = []
+    # 最多两种平台，失败信息可见；不会对所有来源无限重试。
+    keys = [platform] if platform else [k for k in PLATFORMS if k in movie["links"]][:2]
+    for key in keys:
+        if key not in movie["links"]:
+            continue
+        url = canonical_platform_url(movie["links"][key])
+        progress("正在获取“" + movie["title"] + "”的" + PLATFORMS[key] + "弹幕…")
+        try:
+            data = web_json(PUBLIC_DANMAKU + "?" + urllib.parse.urlencode({"ac": "dm", "url": url}))
+            comments = parse_public_comments(data)
+            return comments, PLATFORMS[key] + " · 公益弹幕库", url
+        except ToolError as exc:
+            errors.append(str(exc))
+        try:
+            raw = web_bytes(PUBLIC_DANMAKU_BACKUP + "?" + urllib.parse.urlencode({"type": "xml", "id": url}))
+            comments, _ = parse_comments(raw.decode("utf-8-sig"))
+            return comments, PLATFORMS[key] + " · 公共弹幕库备用", url
+        except (ToolError, UnicodeError) as exc:
+            errors.append(str(exc))
+    raise ToolError("未能取得这部影片的弹幕。" + ("；".join(dict.fromkeys(errors)) if errors else "没有受支持的平台链接。"))
+
+
+@dataclass
+class ScanResult:
+    video: Path
+    identity: dict
+    metadata: dict
+    signature: tuple
+    subtitles: list = field(default_factory=list)
+    movies: list = field(default_factory=list)
+    comments: list = field(default_factory=list)
+    danmaku_source: str = ""
+    danmaku_url: str = ""
+    warnings: list = field(default_factory=list)
+    dm_ass: Ass | None = None
+
+
+def file_signature(video):
+    info = Path(video).stat()
+    return info.st_size, info.st_mtime_ns
+
+
+def scan_movie(video, override="", progress=lambda _: None):
+    video = Path(video).expanduser().resolve()
+    progress("正在读取影片信息…")
+    meta = inspect_video(video)
+    identity = identify_movie(video, override)
+    result = ScanResult(video, identity, meta, file_signature(video))
+    progress(f"识别片名：{identity['title']} {identity['year']}；正在查找字幕和电影弹幕…")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        sub_future = pool.submit(discover_subtitles, video, meta, progress)
+        movie_future = pool.submit(search_movies, identity["title"], identity["year"])
+        try:
+            result.subtitles, warnings = sub_future.result()
+            result.warnings.extend(warnings)
+        except (ToolError, OSError) as exc:
+            result.warnings.append("字幕识别失败：" + str(exc))
+        try:
+            result.movies = movie_future.result()
+        except ToolError as exc:
+            result.warnings.append("电影弹幕搜索失败：" + str(exc))
+    if result.movies:
+        chosen = result.movies[0]
+        if identity["year"] and chosen["year"] and identity["year"] != chosen["year"]:
+            result.warnings.append(f"请核对版本：文件标记 {identity['year']} 年，弹幕平台标记 {chosen['year']} 年，可能是重映/不同剪辑版。")
+        try:
+            length = finite(meta.get("format", {}).get("duration", 0))
+            units = [float(x) for x in chosen["duration"].split(":")]
+            online_length = sum(x * 60 ** i for i, x in enumerate(reversed(units)))
+            if length and online_length and abs(length - online_length) > max(300, length * .1):
+                result.warnings.append(f"片长差异较大：当前文件约 {length / 60:.1f} 分钟，平台标记 {chosen['duration']}，请确认是否同一版本。")
+        except (ValueError, ToolError):
+            pass
+        try:
+            result.comments, result.danmaku_source, result.danmaku_url = fetch_public_danmaku(chosen, progress)
+        except ToolError as exc:
+            result.warnings.append(str(exc))
+    else:
+        result.warnings.append("没有找到匹配的电影弹幕来源。可修正片名后重新识别，或补选弹幕文件。")
+    return result
+
+
+def materialize_subtitle(choice, video):
+    if choice.kind == "file":
+        doc = load_subtitle(choice.path)
+    elif choice.kind == "embedded":
+        doc = extract_subtitle(video, choice.index)
+    elif choice.doc is not None:
+        doc = copy.deepcopy(choice.doc)
+    else:
+        raise ToolError("所选字幕不可用。")
+    shift_events(doc, choice.delay)
+    return doc
+
+
+def synthesize(result, subtitle_index=0, offset=0, density=8, duration=8, font_size=44, progress=lambda _: None):
+    if file_signature(result.video) != result.signature:
+        raise ToolError("影片在识别后发生了变化，请重新选择识别。")
+    if not result.subtitles or not 0 <= subtitle_index < len(result.subtitles):
+        raise ToolError("还没有可合成的文字字幕。")
+    if not result.comments and result.dm_ass is None:
+        raise ToolError("还没有取得弹幕，暂时无法合成。")
+    progress("正在读取/提取所选原台词字幕…")
+    base = materialize_subtitle(result.subtitles[subtitle_index], result.video)
+    progress("正在排列弹幕并合并台词…")
+    if result.dm_ass is not None:
+        dm = copy.deepcopy(result.dm_ass)
+        shift_events(dm, offset, is_danmaku=True)
+        filtered = 0
+    else:
+        length = finite(result.metadata.get("format", {}).get("duration", 0) or 0, "影片时长")
+        shift = finite(offset, "弹幕偏移")
+        comments = [c for c in result.comments if not length or c.time + shift < length]
+        dm, filtered = render_comments(comments, base.resolution, offset, density, duration, font_size)
+        filtered += len(result.comments) - len(comments)
+    final = merge_ass(base, dm)
+    target = result.video.with_name(result.video.stem + "-字幕加弹幕.ass")
+    progress("正在写入影片原目录…")
+    try:
+        output = save_new(target, final.dumps())
+    except OSError as exc:
+        raise ToolError("无法写入影片原目录，请检查 NAS 是否在线、此目录是否有新建文件权限。原文件未覆盖。") from exc
+    return {"output": str(output), "subtitle_lines": len(base.events), "danmaku_lines": len(dm.events), "filtered": filtered}
+
+# ---- 一个窗口：选择、展示、确认合成 ----
+
+class App:
+    def __init__(self, root, initial=""):
+        self.root = root
+        root.title("字幕＋弹幕 · 一键合成 v2")
+        root.geometry("860x650")
+        root.minsize(780, 620)
+        self.result = None
+        self.busy = False
+        self.tasks = queue.Queue()
+        self.path = tk.StringVar(value=initial)
+        self.title = tk.StringVar()
+        self.identity_text = tk.StringVar(value="选择影片后自动识别")
+        self.subtitle = tk.StringVar()
+        self.movie = tk.StringVar()
+        self.dm_text = tk.StringVar(value="等待选择影片")
+        self.status = tk.StringVar(value="选影片 → 自动查找 → 核对字幕与弹幕 → 确认合成")
+        self.offset = tk.StringVar(value="0")
+        self.density = tk.StringVar(value="8")
+        self.output_text = tk.StringVar(value="输出到：所选影片的原目录")
+        style = ttk.Style(root)
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 17, "bold"))
+        style.configure("TLabel", font=("Microsoft YaHei UI", 10))
+        style.configure("TButton", padding=(8, 4))
+        p = ttk.Frame(root, padding=16)
+        p.pack(fill="both", expand=True)
+        head = ttk.Frame(p)
+        head.pack(fill="x")
+        ttk.Label(head, text="字幕＋弹幕", style="Title.TLabel").pack(side="left")
+        ttk.Button(head, text="使用说明", command=self.help).pack(side="right")
+        ttk.Label(p, text="选择一部电影，找到台词和弹幕，合成一条字幕放回原目录。", foreground="#606975").pack(anchor="w", pady=(4, 14))
+        row = ttk.Frame(p)
+        row.pack(fill="x")
+        self.path_entry = ttk.Entry(row, textvariable=self.path)
+        self.path_entry.pack(side="left", fill="x", expand=True)
+        self.path_entry.bind("<Return>", lambda _: self.scan())
+        self.browse_button = ttk.Button(row, text="选择影片…", command=self.browse)
+        self.browse_button.pack(side="left", padx=(8, 0))
+        self.scan_button = ttk.Button(row, text="识别", command=self.scan)
+        self.scan_button.pack(side="left", padx=(6, 0))
+        row = ttk.Frame(p)
+        row.pack(fill="x", pady=10)
+        ttk.Label(row, text="识别片名", width=10).pack(side="left")
+        self.title_entry = ttk.Entry(row, textvariable=self.title)
+        self.title_entry.pack(side="left", fill="x", expand=True)
+        self.retry_button = ttk.Button(row, text="按此片名重查", command=lambda: self.scan(override=True))
+        self.retry_button.pack(side="left", padx=(8, 0))
+        ttk.Label(p, textvariable=self.identity_text, foreground="#606975", wraplength=790).pack(anchor="w", pady=(0, 8))
+        box = ttk.LabelFrame(p, text="找到的原台词字幕", padding=10)
+        box.pack(fill="x", pady=5)
+        self.sub_box = ttk.Combobox(box, state="readonly", textvariable=self.subtitle)
+        self.sub_box.pack(side="left", fill="x", expand=True)
+        self.manual_sub = ttk.Button(box, text="补选字幕…", command=self.pick_subtitle)
+        self.manual_sub.pack(side="left", padx=(8, 0))
+        box = ttk.LabelFrame(p, text="找到的电影弹幕", padding=10)
+        box.pack(fill="x", pady=5)
+        row = ttk.Frame(box)
+        row.pack(fill="x")
+        self.movie_box = ttk.Combobox(row, state="readonly", textvariable=self.movie)
+        self.movie_box.pack(side="left", fill="x", expand=True)
+        self.movie_box.bind("<<ComboboxSelected>>", self.change_movie)
+        self.manual_dm = ttk.Button(row, text="补选弹幕…", command=self.pick_danmaku)
+        self.manual_dm.pack(side="left", padx=(8, 0))
+        ttk.Label(box, textvariable=self.dm_text, wraplength=760, foreground="#31566e").pack(anchor="w", pady=(8, 0))
+        row = ttk.Frame(p)
+        row.pack(fill="x", pady=10)
+        ttk.Label(row, text="弹幕偏移（秒）").pack(side="left")
+        ttk.Entry(row, textvariable=self.offset, width=8).pack(side="left", padx=6)
+        ttk.Label(row, text="正数延后，负数提前", foreground="#606975").pack(side="left")
+        ttk.Label(row, text="最多同屏").pack(side="left", padx=(22, 0))
+        ttk.Spinbox(row, from_=1, to=30, textvariable=self.density, width=5).pack(side="left", padx=6)
+        ttk.Label(row, text="条").pack(side="left")
+        ttk.Label(p, textvariable=self.output_text, wraplength=790).pack(anchor="w", pady=(0, 8))
+        self.generate_button = ttk.Button(p, text="确认合成 → 保存到影片原目录", command=self.generate, state="disabled")
+        self.generate_button.pack(fill="x")
+        self.progress_bar = ttk.Progressbar(p, mode="indeterminate")
+        self.progress_bar.pack(fill="x", pady=(10, 6))
+        ttk.Label(p, textvariable=self.status, wraplength=790).pack(anchor="w")
+        log_frame = ttk.Frame(p)
+        log_frame.pack(fill="both", expand=True, pady=(6, 0))
+        self.log_box = tk.Text(log_frame, height=5, wrap="word", state="disabled", font=("Microsoft YaHei UI", 9))
+        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=scrollbar.set)
+        self.log_box.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.root.after(100, self.poll)
+        if initial:
+            self.root.after(200, self.scan)
+
+    def help(self):
+        win = tk.Toplevel(self.root)
+        win.title("使用说明")
+        win.geometry("740x610")
+        text = tk.Text(win, wrap="word", padx=15, pady=15, font=("Microsoft YaHei UI", 10))
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", HELP)
+        text.configure(state="disabled")
+
+    def log(self, text):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", text + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def browse(self):
+        file = filedialog.askopenfilename(title="选择影片（本地文件或可访问的 NAS 盘）", filetypes=[("影片", "*.mkv *.mp4 *.m4v *.avi *.mov *.ts *.m2ts *.wmv *.webm"), ("所有文件", "*")])
+        if file:
+            self.path.set(file)
+            self.scan()
+
+    def set_busy(self, busy):
+        self.busy = busy
+        state = "disabled" if busy else "normal"
+        for widget in (self.path_entry, self.title_entry, self.browse_button, self.scan_button, self.retry_button, self.manual_sub, self.manual_dm):
+            widget.configure(state=state)
+        self.sub_box.configure(state="disabled" if busy else "readonly")
+        self.movie_box.configure(state="disabled" if busy else "readonly")
+        if busy:
+            self.progress_bar.start(12)
+        else:
+            self.progress_bar.stop()
+        self.update_ready()
+
+    def update_ready(self):
+        ready = not self.busy and self.result is not None and bool(self.result.subtitles) and bool(self.result.comments or self.result.dm_ass)
+        self.generate_button.configure(state="normal" if ready else "disabled")
+
+    def background(self, work, done):
+        if self.busy:
+            return
+        self.set_busy(True)
+        def run():
+            try:
+                self.tasks.put(("done", done, work()))
+            except Exception as exc:
+                self.tasks.put(("error", str(exc), None))
+        threading.Thread(target=run, daemon=True).start()
+
+    def progress(self, message):
+        self.tasks.put(("progress", message, None))
+
+    def poll(self):
+        try:
+            while True:
+                kind, first, second = self.tasks.get_nowait()
+                if kind == "progress":
+                    self.status.set(first)
+                    self.log(first)
+                elif kind == "error":
+                    self.set_busy(False)
+                    self.status.set("未完成：" + first)
+                    self.log(first)
+                    messagebox.showerror("未完成", first)
+                else:
+                    self.set_busy(False)
+                    first(second)
+                    self.update_ready()
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll)
+
+    def scan(self, override=False):
+        if self.busy:
+            return
+        path = self.path.get().strip().strip('"')
+        if not path:
+            return self.browse()
+        title = self.title.get() if override else ""
+        self.result = None
+        self.sub_box.configure(values=[])
+        self.movie_box.configure(values=[])
+        self.subtitle.set("正在识别…")
+        self.movie.set("正在查找…")
+        self.dm_text.set("正在获取…")
+        self.update_ready()
+        def done(result):
+            self.result = result
+            self.path.set(str(result.video))
+            self.title.set(result.identity["title"])
+            length = float(result.metadata.get("format", {}).get("duration", 0) or 0)
+            self.identity_text.set(f"{result.identity['source']}识别 · 年份：{result.identity['year'] or '未知'} · 影片约 {length / 60:.1f} 分钟")
+            self.sub_box.configure(values=[c.label for c in result.subtitles])
+            if result.subtitles:
+                self.sub_box.current(0)
+            else:
+                self.subtitle.set("未找到可用文字字幕（见下方提示）")
+            self.movie_box.configure(values=[f"{m['title']} · {m['year']} · {m['duration'] or '时长未知'}" for m in result.movies])
+            if result.movies:
+                self.movie_box.current(0)
+            else:
+                self.movie.set("未匹配到电影（可以修正片名重查）")
+            self.show_danmaku()
+            self.output_text.set("输出到：" + str(result.video.with_name(result.video.stem + "-字幕加弹幕.ass")))
+            for warning in result.warnings:
+                self.log("提示：" + warning)
+            self.status.set("已找到字幕和弹幕，请核对后确认合成。" if result.subtitles and (result.comments or result.dm_ass) else "识别结束，仍有缺失项，请查看提示。")
+        self.background(lambda: scan_movie(path, title, self.progress), done)
+
+    def show_danmaku(self):
+        r = self.result
+        if r and r.comments:
+            snippets = " / ".join(c.text[:28].replace("\n", " ") for c in r.comments[:2])
+            self.dm_text.set(f"已获取 {len(r.comments):,} 条 · {r.danmaku_source}\n预览：{snippets}")
+        elif r and r.dm_ass:
+            self.dm_text.set(f"已导入 {len(r.dm_ass.events)} 行 ASS 弹幕；保留原字号/密度，画布需与台词相同。")
+        else:
+            self.dm_text.set("尚未获取有效弹幕。可切换候选影片，或修正片名重查。")
+
+    def change_movie(self, _=None):
+        index = self.movie_box.current()
+        if self.busy or not self.result or not 0 <= index < len(self.result.movies):
+            return
+        r = self.result
+        r.comments, r.dm_ass = [], None
+        self.show_danmaku()
+        def done(value):
+            r.comments, r.danmaku_source, r.danmaku_url = value
+            self.show_danmaku()
+            self.status.set("已取得新候选的弹幕，请核对字幕后确认。")
+        self.background(lambda: fetch_public_danmaku(r.movies[index], self.progress), done)
+
+    def pick_subtitle(self):
+        if not self.result:
+            return messagebox.showinfo("先选影片", "先选择影片并完成识别，再补选字幕。")
+        path = filedialog.askopenfilename(title="补选原台词字幕", filetypes=[("文字字幕", "*.srt *.ass")])
+        if path:
+            try:
+                load_subtitle(path)
+                self.result.subtitles.insert(0, SubtitleChoice("手动补选 · " + Path(path).name, "file", 999, path))
+                self.sub_box.configure(values=[c.label for c in self.result.subtitles])
+                self.sub_box.current(0)
+                self.update_ready()
+            except Exception as exc:
+                messagebox.showerror("字幕不可用", str(exc))
+
+    def pick_danmaku(self):
+        if not self.result:
+            return messagebox.showinfo("先选影片", "先选择影片并完成识别，再补选弹幕。")
+        path = filedialog.askopenfilename(title="补选弹幕文件", filetypes=[("弹幕", "*.json *.xml *.ass")])
+        if path:
+            try:
+                if Path(path).suffix.lower() == ".ass":
+                    self.result.dm_ass = parse_ass(read_text(path))
+                    self.result.comments = []
+                else:
+                    self.result.comments, _ = parse_comments(read_text(path))
+                    self.result.dm_ass = None
+                self.result.danmaku_source = "手动补选 · " + Path(path).name
+                self.movie.set(self.result.danmaku_source)
+                self.show_danmaku()
+                self.update_ready()
+            except Exception as exc:
+                messagebox.showerror("弹幕不可用", str(exc))
+
+    def generate(self):
+        r = self.result
+        if self.busy or r is None:
+            return
+        try:
+            current = Path(self.path.get().strip().strip('"')).expanduser().resolve()
+            if current != r.video:
+                raise ToolError("路径已经改变，请点击“识别”重新读取后再合成。")
+            index = self.sub_box.current()
+            offset, density = finite(self.offset.get()), int(self.density.get())
+        except (ToolError, ValueError, OSError) as exc:
+            return messagebox.showerror("请检查输入", str(exc))
+        def done(value):
+            self.status.set("合成完成，已保存到影片原目录。")
+            self.output_text.set("已保存：" + value["output"])
+            self.log(f"台词 {value['subtitle_lines']} 行，弹幕 {value['danmaku_lines']} 条；限流/去重 {value['filtered']} 条。")
+            messagebox.showinfo("合成完成", value["output"] + "\n\n在极影视中选择这条“字幕加弹幕”字幕即可。")
+        self.background(lambda: synthesize(r, index, offset, density, progress=self.progress), done)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="选择影片→自动找字幕和弹幕→确认合成到原目录。单文件，无需 API 密钥。")
+    parser.add_argument("video", nargs="?", help="可选：本地/可访问 NAS 影片路径")
+    args = parser.parse_args(argv)
+    root = tk.Tk()
+    App(root, args.video or "")
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

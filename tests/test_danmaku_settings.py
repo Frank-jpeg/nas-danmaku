@@ -33,7 +33,7 @@ class RenderSettingsTests(unittest.TestCase):
 
     def test_fixed_reverse_and_scroll_share_lanes_inside_selected_region(self):
         comments = [d.Comment(0, '顶部', mode=5), d.Comment(0, '底部', mode=4),
-                    d.Comment(0, '反向', mode=6), d.Comment(0, '滚动')]
+                    d.Comment(0, '反向', mode=6), d.Comment(2, '滚动')]
         doc, omitted = d.render_comments(comments, (1920, 1080), block_fixed=False)
         self.assertEqual(omitted, 0)
         positions = [float(re.search(r'\\(?:pos|move)\([^,]+,([\d.]+)', row['Text'])[1]) for row in doc.events]
@@ -45,7 +45,7 @@ class RenderSettingsTests(unittest.TestCase):
         self.assertEqual(len(limited.events), 2)
 
     def test_protected_area_and_opacity_never_change_dialogue_style(self):
-        comments = [d.Comment(0, f'一行 {i}') for i in range(40)]
+        comments = [d.Comment(i * .3, f'一行 {i}') for i in range(40)]
         protected, _ = d.render_comments(comments, (1920, 1080), density=30, area=100, opacity=37)
         full, _ = d.render_comments(comments, (1920, 1080), density=30, area=100, avoid_subtitles=False)
         ys = lambda doc: [float(re.search(r'\\move\([^,]+,([^,]+)', e['Text'])[1]) for e in doc.events]
@@ -79,7 +79,7 @@ class RenderSettingsTests(unittest.TestCase):
                 d.render_comments([d.Comment(0, '文字')], (1920, 1080), **settings)
 
     def test_public_modes_are_preserved_for_filtering(self):
-        rows = [[0, mode, '#fff', '25', mode] for mode in ('right', 'top', 'bottom', 'left', 'advanced')]
+        rows = [[2 if mode == 'left' else 0, mode, '#fff', '25', mode] for mode in ('right', 'top', 'bottom', 'left', 'advanced')]
         comments = d.parse_public_comments({'code': 23, 'danmuku': rows})
         self.assertEqual([c.mode for c in comments], [1, 5, 4, 6])
         doc, omitted = d.render_comments(comments, (1920, 1080))

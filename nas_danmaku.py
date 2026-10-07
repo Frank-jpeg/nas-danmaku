@@ -31,7 +31,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
@@ -440,7 +440,10 @@ def render_comments(comments, resolution, offset=0, density=6, duration=8, font_
     lanes = int((bottom - top) / row_height)
     if lanes < 1:
         raise ToolError("当前显示区域放不下一行弹幕，请缩小字号或增大显示区域。")
-    available = [-1.0] * lanes
+    occupants = [[] for _ in range(lanes)]
+    last_entry = [-math.inf] * lanes
+    next_scroll = -math.inf
+    gap = max(size * 1.5, width * .015)
     doc = Ass(styles={"Scroll": style("Scroll", round(size, 2))})
     doc.info.update(PlayResX=str(width), PlayResY=str(height), WrapStyle="2")
     doc.styles["Scroll"].update(Alignment="7", Outline=str(round(max(1, size / 22), 2)), MarginL="0", MarginR="0", MarginV="0")
@@ -454,27 +457,51 @@ def render_comments(comments, resolution, offset=0, density=6, duration=8, font_
         # 计数指已检查的条目，包含去重/限流丢弃项。
         if index and index % max(1, total // 100) == 0:
             report(progress, "排列弹幕", index, total, "条")
-        at = comment.time + offset
+        original_at = comment.time + offset
+        # 按 ASS 实际写入的厘秒计算轨迹，避免四舍五入后发生重叠。
+        at = round(original_at * 100) / 100
+        end = round((original_at + duration) * 100) / 100
         fixed = comment.mode in (4, 5)
         if (fixed and block_fixed) or (not fixed and block_scroll) or (block_color and comment.color != 0xFFFFFF):
             omitted += 1
             continue
         message = escape_text(comment.text)[:120]
-        if at < 0 or (deduplicate and message in seen and at - seen[message] < 15):
+        if original_at < 0 or (deduplicate and message in seen and at - seen[message] < 15):
             omitted += 1
             continue
-        order = range(lanes - 1, -1, -1) if comment.mode == 4 else range(lanes)
-        lane = next((i for i in order if available[i] <= at), None)
-        if sum(end > at for end in available) >= density:
-            lane = None
-        if lane is None:
+        for active in occupants:
+            active[:] = [item for item in active if item[1] > at]
+        # 均匀准入，避免开头瞬间填满上限后等待整批离场；不挪动原弹幕时间。
+        if sum(map(len, occupants)) >= density or (not fixed and at + 1e-9 < next_scroll):
             omitted += 1
             continue
-        seen[message] = at
-        available[lane] = at + duration
-        # 所有模式共用行占用表；固定/反向弹幕也不能与滚动弹幕相撞。
         units = sum(1 if unicodedata.east_asian_width(c) in "WF" else .65 for c in message)
-        length = max(size, units * size * 1.2)
+        length = round(max(size, units * size * 1.2), 2)
+        speed = (width + 10 + length) / (end - at)
+        direction = 0 if fixed else -1 if comment.mode == 6 else 1
+
+        def can_enter(active):
+            for previous_at, previous_end, previous_length, previous_speed, previous_direction in active:
+                # 固定和反向相遇保守地独占行；同向则检查整段共同显示时间。
+                if not direction or previous_direction != direction:
+                    return False
+                initial_gap = previous_speed * (at - previous_at) - previous_length
+                final_gap = initial_gap + (previous_speed - speed) * (min(end, previous_end) - at)
+                if min(initial_gap, final_gap) < gap:
+                    return False
+            return True
+
+        order = range(lanes - 1, -1, -1) if comment.mode == 4 else range(lanes)
+        candidates = [i for i in order if can_enter(occupants[i])]
+        if not candidates:
+            omitted += 1
+            continue
+        lane = candidates[0] if fixed else min(candidates, key=lambda i: (len(occupants[i]), last_entry[i]))
+        seen[message] = at
+        occupants[lane].append((at, end, length, speed, direction))
+        last_entry[lane] = at
+        if not fixed:
+            next_scroll = at + duration / density
         color = comment.color
         bgr = f"{color & 255:02X}{color >> 8 & 255:02X}{color >> 16 & 255:02X}"
         y = top + lane * row_height
@@ -485,7 +512,7 @@ def render_comments(comments, resolution, offset=0, density=6, duration=8, font_
         else:
             position = f"\\an7\\move({width + 10},{y:.2f},{-length:.2f},{y:.2f})"
         tags = f"{{{position}\\q2\\alpha&H{alpha:02X}&\\c&H{bgr}&}}"
-        doc.events.append(event(round(at * 100), round((at + duration) * 100), tags + message, "Scroll"))
+        doc.events.append(event(round(at * 100), round(end * 100), tags + message, "Scroll"))
     if not doc.events:
         raise ToolError("偏移/过滤后没有可显示的弹幕，请调整参数。")
     report(progress, "排列弹幕", total, total, "条", complete=True)
@@ -667,6 +694,7 @@ NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS
 识别结果需核对片名、年份、时长，平台上架年份有时与上映年不同。
 弹幕偏移：正数延后、负数提前。不同剪辑版本可能无法只用一个偏移完全对齐。
 默认弹幕只在顶部 1/4 滚动，字号 32（1080p 基准）、不透明度 80%、最多同屏 6 条，屏蔽固定弹幕。
+同向弹幕留够安全间距即可接续进入，按同屏上限分散进入节奏，不再等待整批走完；原时间点不后移。
 “弹幕设置”可调显示区域、字号、不透明度、速度及类型过滤；只影响弹幕，不改原台词字幕。
 勾选防挡字幕时，即使放大区域也会保留底部 32%；固定弹幕手动开启后同样限制在所选区域内。
 设置保留在当前窗口，重新启动恢复默认。调整后点确认合成，无需重新下载；已有 ASS 不会自动改变。

@@ -45,7 +45,7 @@ class CoreTests(unittest.TestCase):
         js, _ = d.parse_comments(json.dumps({"comments": [{"p": "1.2,1,255,user", "m": "蓝色"}]}))
         self.assertEqual(xml[0].color, 0xFF0000)
         self.assertEqual(js[0].color, 255)
-        doc, _ = d.render_comments(xml + js, (1920, 1080))
+        doc, _ = d.render_comments(xml + js, (1920, 1080), density=30)
         self.assertIn(r"\c&HFF0000&", doc.events[0]["Text"])
         self.assertIn(r"\c&H0000FF&", doc.events[1]["Text"])
 

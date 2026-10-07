@@ -28,10 +28,11 @@ import urllib.request
 import uuid
 import webbrowser
 import zipfile
+import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -1621,7 +1622,7 @@ def canonical_platform_url(url):
     if parsed.scheme not in {"http", "https"} or not any(host == h or host.endswith("." + h) for h in HOSTS):
         raise ToolError("未识别的影片平台链接。")
     # 优酷 video?vid= 必须保留 vid；去掉广告跟踪参数。
-    query = urllib.parse.urlencode({k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items() if k in {"vid", "id", "cid", "bvid"}})
+    query = urllib.parse.urlencode({k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items() if k in {"vid", "id", "cid", "bvid", "p"}})
     return urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path, query, ""))
 
 
@@ -1653,6 +1654,159 @@ def parse_public_comments(data):
     return comments
 
 
+def bili_fields(raw):
+    """Read the small protobuf subset used by Bilibili, rejecting truncated data."""
+    offset = 0
+
+    def varint():
+        nonlocal offset
+        value = 0
+        for shift in range(0, 70, 7):
+            if offset >= len(raw):
+                raise ToolError("B 站分段数据不完整。")
+            byte = raw[offset]
+            offset += 1
+            value |= (byte & 127) << shift
+            if byte < 128:
+                return value
+        raise ToolError("B 站分段整数格式错误。")
+
+    while offset < len(raw):
+        tag = varint()
+        number, wire = tag >> 3, tag & 7
+        if not number:
+            raise ToolError("B 站分段字段格式错误。")
+        if wire == 0:
+            value = varint()
+        elif wire in (1, 2, 5):
+            size = varint() if wire == 2 else (8 if wire == 1 else 4)
+            if size > len(raw) - offset:
+                raise ToolError("B 站分段数据不完整。")
+            value = raw[offset:offset + size]
+            offset += size
+        else:
+            raise ToolError("B 站分段字段类型不支持。")
+        yield number, wire, value
+
+
+def bili_xml_rows(raw):
+    # comment.bilibili.com can return raw deflate despite Accept-Encoding: identity.
+    if not raw.lstrip().startswith((b"<", b"\xef\xbb\xbf")):
+        for window in (-15, 15, 31):
+            try:
+                decoder = zlib.decompressobj(window)
+                decoded = decoder.decompress(raw, MAX_BYTES + 1)
+                if len(decoded) > MAX_BYTES or decoder.unconsumed_tail:
+                    raise ToolError("B 站 XML 解压超过 32 MB。")
+                if decoder.eof:
+                    raw = decoded
+                    break
+            except zlib.error:
+                continue
+    root = ET.fromstring(raw)
+    rows = []
+    for node in root.iter("d"):
+        parts = node.attrib.get("p", "").split(",")
+        try:
+            rows.append((parts[7], Comment(finite(parts[0]), "".join(node.itertext()),
+                                           int(parts[3]) & 0xFFFFFF, int(parts[1]))))
+        except (ValueError, IndexError, ToolError):
+            continue
+    return rows
+
+
+def bili_segment_rows(raw):
+    rows = []
+    for number, wire, value in bili_fields(raw):
+        if number != 1 or wire != 2:
+            continue
+        fields = {n: v for n, w, v in bili_fields(value)}
+        identity = fields.get(12, b"").decode("utf-8") or str(fields.get(1, 0))
+        rows.append((identity, Comment(fields.get(2, 0) / 1000,
+                                      fields.get(7, b"").decode("utf-8"),
+                                      fields.get(5, 16777215) & 0xFFFFFF, fields.get(3, 1))))
+    return rows
+
+
+def fetch_bilibili_danmaku(url, progress=None):
+    """Merge legacy XML and all six-minute segments by comment ID."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        episode = re.search(r"/ep(\d+)", parsed.path)
+        video = re.search(r"/(BV[0-9A-Za-z]+|av\d+)", parsed.path)
+        if episode:
+            ep = int(episode[1])
+            data = web_json(f"https://api.bilibili.com/pgc/view/web/season?ep_id={ep}", progress=progress)
+            entries = data.get("result", {}).get("episodes", [])
+            entry = next((item for item in entries if item.get("id") == ep), None)
+            if data.get("code", 0) != 0 or entry is None:
+                raise ToolError("B 站未返回所选剧集 CID。")
+            cid, aid = int(entry["cid"]), int(entry["aid"])
+        elif video:
+            identity = video[1]
+            query = "bvid=" + identity if identity.startswith("BV") else "aid=" + identity[2:]
+            data = web_json("https://api.bilibili.com/x/web-interface/view?" + query, progress=progress)
+            if data.get("code", 0) != 0:
+                raise ToolError("B 站视频信息查询失败。")
+            page = int(urllib.parse.parse_qs(parsed.query).get("p", ["1"])[0])
+            entry = data["data"]
+            selected = next((item for item in entry["pages"] if item["page"] == page), None)
+            if selected is None:
+                raise ToolError("B 站没有所选分 P。")
+            cid, aid = int(selected["cid"]), int(entry["aid"])
+        else:
+            raise ToolError("B 站直连暂不支持此链接。")
+        if cid <= 0 or aid <= 0:
+            raise ToolError("B 站返回了无效 CID。")
+        headers = {"Referer": url}
+        rows, errors = [], []
+        try:
+            raw = web_bytes(f"https://comment.bilibili.com/{cid}.xml", request_headers=headers,
+                            progress=progress, message="下载 B 站 XML 弹幕")
+            rows.extend(bili_xml_rows(raw))
+        except (ToolError, ET.ParseError, UnicodeError, ValueError) as exc:
+            errors.append("XML：" + str(exc))
+        try:
+            raw = web_bytes(f"https://api.bilibili.com/x/v2/dm/web/view?type=1&oid={cid}&pid={aid}",
+                            request_headers=headers, progress=progress, message="查询 B 站弹幕分段")
+            config = next((dict((n, v) for n, w, v in bili_fields(value))
+                           for number, wire, value in bili_fields(raw) if number == 4 and wire == 2), {})
+            count = config.get(2, 0)
+            if not isinstance(count, int) or not 1 <= count <= 100:
+                raise ToolError("B 站弹幕分段数量无效。")
+
+            def fetch_segment(index):
+                try:
+                    raw = web_bytes(f"https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid={cid}&segment_index={index}",
+                                    request_headers=headers, timeout=20)
+                    return bili_segment_rows(raw), ""
+                except (ToolError, UnicodeError, ValueError, TypeError, AttributeError) as exc:
+                    return [], f"分段 {index}：{exc}"
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                for index, (items, error) in enumerate(pool.map(fetch_segment, range(1, count + 1)), 1):
+                    rows.extend(items)
+                    if error:
+                        errors.append(error)
+                    report(progress, "下载 B 站分段弹幕", index, count, "段")
+        except (ToolError, ValueError, TypeError) as exc:
+            errors.append("分段：" + str(exc))
+        merged = {}
+        for identity, comment in rows:
+            if comment.mode not in (1, 2, 3, 4, 5, 6) or comment.time < 0 or not comment.text.strip():
+                continue
+            key = ("id", identity) if identity and identity != "0" else ("content", comment.time, comment.text, comment.color, comment.mode)
+            merged[key] = comment
+        if not merged:
+            raise ToolError("B 站直连没有可用弹幕。" + "；".join(errors))
+        source = "哔哩哔哩 · 直连 XML＋分段"
+        if errors:
+            source += "（部分获取，" + "；".join(errors) + "）"
+        return sorted(merged.values(), key=lambda c: c.time), source, url
+    except (KeyError, ValueError, TypeError, AttributeError, UnicodeError) as exc:
+        raise ToolError("B 站接口数据格式异常：" + str(exc)) from None
+
+
 def fetch_public_danmaku(movie, progress, platform=None):
     errors = []
     if platform is not None and (platform not in PLATFORMS or platform not in movie["links"]):
@@ -1663,6 +1817,12 @@ def fetch_public_danmaku(movie, progress, platform=None):
         if key not in movie["links"]:
             continue
         url = canonical_platform_url(movie["links"][key])
+        if key == "bilibili1":
+            try:
+                return fetch_bilibili_danmaku(url, progress)
+            except ToolError as exc:
+                errors.append(str(exc))
+                report(progress, f"B 站直连失败，尝试公共弹幕库：{exc}")
         try:
             data = web_json(PUBLIC_DANMAKU + "?" + urllib.parse.urlencode({"ac": "dm", "url": url}),
                             progress=progress, message=f"下载{PLATFORMS[key]}弹幕（主源）")

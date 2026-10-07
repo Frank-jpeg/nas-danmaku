@@ -1,6 +1,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import io
+import gc
 import tempfile
 import threading
 import tkinter as tk
@@ -119,6 +120,7 @@ class WorkProgressTests(unittest.TestCase):
             video.write_bytes(b'test')
             updates = []
             with patch.object(d, 'inspect_video', return_value={}), \
+                    patch.object(d, 'local_workspace', return_value=Path(tmp).resolve()), \
                     patch.object(d, 'discover_subtitles', return_value=([], [])), \
                     patch.object(d, 'search_movies', return_value=[]):
                 result = d.scan_movie(video, progress=updates.append)
@@ -134,8 +136,13 @@ class GuiProgressTests(unittest.TestCase):
         except tk.TclError:
             self.skipTest('没有可用的 Tk 显示环境')
         self.root.withdraw()
-        self.addCleanup(self.root.destroy)
+        self.addCleanup(self.cleanup_gui)
         self.app = d.App(self.root)
+
+    def cleanup_gui(self):
+        self.root.destroy()
+        del self.app
+        gc.collect()
 
     def test_elapsed_time_never_advances_percentage(self):
         app = self.app

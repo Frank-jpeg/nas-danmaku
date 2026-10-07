@@ -1,4 +1,5 @@
 from pathlib import Path
+import gc
 import os
 import tempfile
 import tkinter as tk
@@ -15,6 +16,13 @@ def unsupported_volume():
 
 
 class VirtualPathTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        fixture = patch.object(d, 'local_workspace', side_effect=lambda: Path(tempfile.mkdtemp(dir=tmp.name)))
+        fixture.start()
+        self.addCleanup(fixture.stop)
+
     def test_fallback_normalizes_relative_path(self):
         selected = Path('folder') / '..' / 'movie.mkv'
         expected = Path(os.path.abspath(selected))
@@ -64,7 +72,7 @@ class VirtualPathTests(unittest.TestCase):
             root = tk.Tk()
         except tk.TclError:
             self.skipTest('没有可用的 Tk 显示环境')
-        self.addCleanup(root.destroy)
+        self.addCleanup(lambda: (root.destroy(), gc.collect()))
         root.withdraw()
         app = d.App(root)
         video = Path(os.path.abspath('movie.mkv'))

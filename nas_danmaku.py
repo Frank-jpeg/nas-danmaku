@@ -16,15 +16,17 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.0.3"
+VERSION = "2.1.0"
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
@@ -517,11 +519,11 @@ def merge_ass(subtitles, danmaku):
     return base
 
 
-def save_new(path, text, progress=None):
+def save_new(path, text, progress=None, message="写入影片原目录"):
     path = Path(path)
     raw = text.encode("utf-8")
     total = len(raw)
-    report(progress, "写入影片原目录", 0, total, "字节")
+    report(progress, message, 0, total, "字节")
     path.parent.mkdir(parents=True, exist_ok=True)
     for version in range(1, 10000):
         candidate = path if version == 1 else path.with_name(f"{path.stem}-v{version}{path.suffix}")
@@ -536,8 +538,8 @@ def save_new(path, text, progress=None):
                 if not count:
                     raise OSError("字幕文件写入中断。")
                 written += count
-                report(progress, "写入影片原目录", written, total, "字节")
-        report(progress, "写入影片原目录", total, total, "字节", complete=True)
+                report(progress, message, written, total, "字节")
+        report(progress, message, total, total, "字节", complete=True)
         return candidate
     raise ToolError("同名版本文件过多，请换一个输出目录。")
 
@@ -603,6 +605,7 @@ from tkinter import filedialog, messagebox, ttk
 PUBLIC_DANMAKU = "https://dmku.hls.one/"
 PUBLIC_DANMAKU_BACKUP = "https://danmu.zxz.ee/"
 SHOOTER_API = "https://www.shooter.cn/api/subapi.php"
+THUNDER_SUBTITLE_API = "https://api-shoulei-ssl.xunlei.com/oracle/subtitle"
 KAN_SEARCH = "https://api.so.360kan.com/index"
 PLATFORMS = {"qq": "腾讯视频", "qiyi": "爱奇艺", "bilibili1": "哔哩哔哩", "youku": "优酷", "imgo": "芒果TV"}
 HOSTS = ("qq.com", "iqiyi.com", "bilibili.com", "youku.com", "mgtv.com")
@@ -614,13 +617,16 @@ HELP = """字幕弹幕一键合成 v2（单文件）
 只需要这一个 .py；Python 3.10+（含 Tkinter）。读取影片信息和内封文字字幕需要先安装 ffprobe/ffmpeg，并确保可在命令行中运行。
 路径必须是 Windows 能读取的本地/映射盘/UNC 路径。极空间 App 里的虚拟路径或分享链接不能直接当文件路径。
 
-自动字幕：同目录匹配字幕 → 内封文字轨 → 射手按影片四段指纹搜索。
+自动字幕：同目录外挂中文字幕 → 迅雷按片名/年份搜索 → 射手按影片四段指纹搜索。
 若只有 PGS/SUP 图片字幕且在线未找到文字字幕，会明确提示；本工具不做 OCR、不假装已成功。
-提取内封字幕可能需扫描影片；异地 NAS 的耗时取决于网络。识别阶段只探测轨道，点击合成后才提取。
+内封字幕只在手动点“使用内封”后选用；提取可能需扫描影片，异地较慢。
+台词和弹幕先缓存到本机，合成后仅将最终 ASS 写回 NAS；不下载整部视频。
+NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS”，不用重新合成。
+缓存和成品保存在 %LOCALAPPDATA%/NasDanmaku/cache，界面日志会显示具体目录。
 
 弹幕：按片名通过 360 影视查找电影平台链接，再向公开弹幕库按需请求；不需要你填密钥。
 公开服务： https://dmku.hls.one/ ；备用 https://danmu.zxz.ee/ 。
-字幕协议： https://www.shooter.cn/api/subapi.php （https://github.com/qzane/SPlayerSubDownloader 中有协议说明）。
+在线字幕：迅雷字幕按片名查询；备用 https://www.shooter.cn/api/subapi.php 按视频指纹查询。
 这些外部服务可能变更/限流、没有某部电影的数据。失败会显示原因，支持修改片名重新识别或手动补选文件。
 只发送查询片名、影片文件名/四段 MD5 和公开平台链接；不上传电影、原台词内容、NAS 目录或账号。
 
@@ -731,13 +737,17 @@ def identify_movie(video, override=""):
 
 
 def inspect_video(video):
+    validate_video(video)
+    return json.loads(run_media("ffprobe", ["-probesize", "8000000", "-analyzeduration", "5000000",
+                      "-show_streams", "-show_format", "-of", "json", str(video)], timeout=20))
+
+
+def validate_video(video):
     video = Path(video)
     if not video.is_file():
         raise ToolError("影片路径当前不可访问。NAS 盘请先在文件资源管理器里打开并登录，然后重试。")
     if video.suffix.lower() not in {".mkv", ".mp4", ".m4v", ".mov", ".avi", ".ts", ".m2ts", ".wmv", ".webm"}:
         raise ToolError("请选择常见影片文件，例如 MKV/MP4；不支持把网页分享链接当作文件路径。")
-    meta = json.loads(run_media("ffprobe", ["-show_streams", "-show_format", "-of", "json", str(video)], timeout=60))
-    return meta
 
 
 @dataclass
@@ -749,6 +759,21 @@ class SubtitleChoice:
     index: int | None = None
     doc: Ass | None = None
     delay: float = 0
+
+
+def local_workspace():
+    base = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "NasDanmaku" / "cache"
+    base.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="movie-", dir=base))
+
+
+def cache_subtitle(choice, folder):
+    if choice.doc is None:
+        choice.doc = load_subtitle(choice.path)
+    # 缓存原始时间轴；服务返回的 delay 只在合成时应用一次。
+    path = save_new(Path(folder) / "subtitle.ass", choice.doc.dumps(), message="缓存台词字幕到本机")
+    choice.path = str(path)
+    return choice
 
 
 def language_score(text):
@@ -852,20 +877,115 @@ def online_subtitles(video):
     return choices
 
 
-def discover_subtitles(video, meta, progress):
-    choices = sidecar_choices(video) + embedded_choices(meta)
-    warnings = []
-    # 内封中文字幕存在时不请求网络字幕；英语/未知语言仍尝试找到匹配的中文。
-    if not choices or max(c.score for c in choices) < 90:
-        progress("正在按影片指纹查找在线中文字幕…")
+def title_subtitles(video, identity, meta, progress=None):
+    title, year = identity["title"], identity.get("year", "")
+    bilingual = re.match(r"^([\u4e00-\u9fff][^A-Za-z]*?)\s+[A-Za-z]", title)
+    query = bilingual[1].strip() if bilingual else title
+    report(progress, "按片名搜索在线中文字幕")
+    data = web_json(THUNDER_SUBTITLE_API + "?" +
+                    urllib.parse.urlencode({"name": (query + " " + year).strip()}))
+    if not isinstance(data, dict) or data.get("code") != 0 or not isinstance(data.get("data"), list):
+        raise ToolError("迅雷字幕源未返回有效列表。")
+    length = finite(meta.get("format", {}).get("duration", 0) or 0)
+    ranked, seen = [], set()
+    for row in data["data"]:
+        if not isinstance(row, dict):
+            continue
+        name, simple = str(row.get("name", "")), str(row.get("simple_name", ""))
+        ext, url = str(row.get("ext", "")).lower().lstrip("."), row.get("url")
+        if ext not in {"srt", "ass"} or not isinstance(url, str) or url in seen:
+            continue
+        # 标题检索不等于精确版本匹配：拒绝另一部片、冲突年份和分碟字幕。
+        if normalize_title(query) not in normalize_title(simple + " " + name):
+            continue
+        years = re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", simple + " " + name)
+        if year and years and year not in years:
+            continue
+        if re.search(r"(?i)(?:^|[. _\-])(?:cd|disc|disk|d)[ ._\-]*[1-9](?:[. _\-]|$)", name):
+            continue
+        langs = row.get("languages", [])
+        if not isinstance(langs, list):
+            continue
+        score = language_score(" ".join(str(x) for x in langs) + " " + simple)
+        if score < 90:
+            continue
         try:
-            choices += online_subtitles(video)
-        except ToolError as exc:
+            end = finite(row.get("duration", 0) or 0) / 1000
+        except ToolError:
+            continue
+        # duration 是末句字幕时间，不是影片片长；允许片尾无台词。
+        if length and end and not length * .70 <= end <= length * 1.10:
+            continue
+        if "简体" in langs:
+            score += 10
+        if "双语" in simple + name or "中英" in simple + name:
+            score += 5
+        if year and year in years:
+            score += 5
+        if length and end:
+            score += max(0, 10 - abs(length - end) / length * 50)
+        seen.add(url)
+        ranked.append((score, row))
+    choices, errors = [], []
+    for _, row in sorted(ranked, key=lambda x: -x[0])[:6]:
+        ext = str(row["ext"]).lower().lstrip(".")
+        try:
+            raw = web_bytes(row["url"], timeout=12, progress=progress, message="下载在线台词字幕到本机")
+            text = decode_subtitle(raw)
+            doc = parse_srt(text) if ext == "srt" else parse_ass(text)
+            if len(doc.events) < 10 or not any(re.search(r"[\u4e00-\u9fff]", e["Text"]) for e in doc.events):
+                raise ToolError("下载内容不是完整中文字幕。")
+            label = "在线 · 迅雷 · " + str(row.get("name", ""))[:100] + "（需核对版本）"
+            choices.append(SubtitleChoice(label, "online", 100, doc=doc))
+        except (ToolError, UnicodeError, OSError) as exc:
+            errors.append(str(exc))
+            if len(errors) >= 2:
+                break
+            continue
+        if len(choices) >= 3:
+            break
+    if ranked and not choices:
+        raise ToolError("迅雷已找到候选字幕，但下载或解析失败：" + "；".join(dict.fromkeys(errors)))
+    return choices
+
+
+def discover_subtitles(video, meta, progress, identity=None, folder=None):
+    choices = []
+    warnings = []
+    folder = folder or local_workspace()
+    try:
+        sidecars = sidecar_choices(video)
+    except OSError as exc:
+        sidecars = []
+        warnings.append("影片目录暂不可读取，继续查询在线字幕：" + str(exc))
+    for choice in sidecars:
+        try:
+            choices.append(cache_subtitle(choice, folder))
+        except (ToolError, OSError) as exc:
+            warnings.append("外挂字幕读取失败：" + str(exc))
+    # 不再因为有内封中文而跳过在线查询；默认合成不扫描远程视频。
+    if not choices or max(c.score for c in choices) < 90:
+        try:
+            online = title_subtitles(video, identity or identify_movie(video), meta, progress)
+        except (ToolError, OSError) as exc:
             warnings.append(str(exc))
+            online = []
+        if not online:
+            progress("正在按影片指纹查找备用在线字幕（少量读取影片）…")
+            try:
+                online = online_subtitles(video)
+            except (ToolError, OSError) as exc:
+                warnings.append(str(exc))
+        for choice in online:
+            try:
+                choices.append(cache_subtitle(choice, folder))
+            except (ToolError, OSError) as exc:
+                warnings.append("本地缓存字幕失败：" + str(exc))
+        if online:
+            warnings.append("在线字幕已缓存到本机；请核对发行版本和台词时间，按片名命中不保证时间轴一致。")
     choices.sort(key=lambda c: -c.score)
     if not choices:
-        image = any(s.get("codec_type") == "subtitle" for s in meta.get("streams", []))
-        warnings.append("仅检测到图片字幕，在线没有匹配的文字字幕。需要 OCR 或补选文字字幕。" if image else "影片没有可用文字字幕，在线也未找到；可以补选一份原台词 SRT/ASS。")
+        warnings.append("没有找到可用外挂/在线文字字幕。可补选 SRT/ASS；如要读取内封文字轨，请手动点“使用内封”。")
     return choices, warnings
 
 
@@ -988,6 +1108,7 @@ class ScanResult:
     danmaku_url: str = ""
     warnings: list = field(default_factory=list)
     dm_ass: Ass | None = None
+    workspace: Path | None = None
 
 
 def file_signature(video):
@@ -997,14 +1118,25 @@ def file_signature(video):
 
 def scan_movie(video, override="", progress=lambda _: None):
     video = normalize_path(video)
+    validate_video(video)
+    signature = file_signature(video)
     progress("正在读取影片信息…")
-    meta = inspect_video(video)
-    identity = identify_movie(video, override)
-    result = ScanResult(video, identity, meta, file_signature(video))
+    warnings = []
+    try:
+        meta = inspect_video(video)
+    except (ToolError, OSError) as exc:
+        meta = {}
+        warnings.append("影片信息探测未完成，继续按片名搜索外挂字幕；片长暂未知。" + str(exc))
+    try:
+        identity = identify_movie(video, override)
+    except OSError:
+        title, year = filename_title(video.stem)
+        identity = {"title": override.strip() or title, "year": year, "source": "修正片名" if override.strip() else "文件名"}
+    result = ScanResult(video, identity, meta, signature, warnings=warnings, workspace=local_workspace())
     progress(f"识别片名：{identity['title']} {identity['year']}；正在查找字幕和电影弹幕…")
     report(progress, "查找字幕和电影来源", 0, 2, "项")
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        sub_future = pool.submit(discover_subtitles, video, meta, lambda _: None)
+        sub_future = pool.submit(discover_subtitles, video, meta, lambda _: None, identity, result.workspace)
         movie_future = pool.submit(search_movies, identity["title"], identity["year"])
         for count, future in enumerate(concurrent.futures.as_completed([sub_future, movie_future]), 1):
             try:
@@ -1035,16 +1167,30 @@ def scan_movie(video, override="", progress=lambda _: None):
             result.warnings.append(str(exc))
     else:
         result.warnings.append("没有找到匹配的电影弹幕来源。可修正片名后重新识别，或补选弹幕文件。")
+    cache_danmaku(result, progress)
     return result
 
 
+def cache_danmaku(result, progress=None):
+    if result.workspace is None:
+        result.workspace = local_workspace()
+    if result.dm_ass is not None:
+        save_new(result.workspace / "danmaku.ass", result.dm_ass.dumps(), progress, "缓存弹幕到本机")
+    elif result.comments:
+        text = json.dumps([{"time": c.time, "text": c.text, "color": c.color, "mode": c.mode}
+                           for c in result.comments], ensure_ascii=False)
+        save_new(result.workspace / "danmaku.json", text, progress, "缓存弹幕到本机")
+
+
 def materialize_subtitle(choice, video, progress=None, duration=None):
-    if choice.kind == "file":
+    if choice.doc is not None:
+        doc = copy.deepcopy(choice.doc)
+    elif choice.kind == "file":
         doc = load_subtitle(choice.path)
     elif choice.kind == "embedded":
         doc = extract_subtitle(video, choice.index, progress=progress, duration=duration)
-    elif choice.doc is not None:
-        doc = copy.deepcopy(choice.doc)
+        # 用户手动提取一次后，调整弹幕再合成时直接复用。
+        choice.doc = copy.deepcopy(doc)
     else:
         raise ToolError("所选字幕不可用。")
     shift_events(doc, choice.delay)
@@ -1052,15 +1198,19 @@ def materialize_subtitle(choice, video, progress=None, duration=None):
 
 
 def synthesize(result, subtitle_index=0, offset=0, density=8, duration=8, font_size=44, progress=lambda _: None):
-    if file_signature(result.video) != result.signature:
-        raise ToolError("影片在识别后发生了变化，请重新选择识别。")
     if not result.subtitles or not 0 <= subtitle_index < len(result.subtitles):
         raise ToolError("还没有可合成的文字字幕。")
     if not result.comments and result.dm_ass is None:
         raise ToolError("还没有取得弹幕，暂时无法合成。")
-    progress("正在读取/提取所选原台词字幕…")
+    if result.workspace is None:
+        result.workspace = local_workspace()
+    choice = result.subtitles[subtitle_index]
+    if choice.kind == "embedded" and choice.doc is None and file_signature(result.video) != result.signature:
+        raise ToolError("影片在识别后发生了变化，请重新选择识别。")
+    progress("正在本机准备原台词字幕…" if choice.kind != "embedded" or choice.doc is not None else "手动提取内封字幕（需要读取影片）…")
     length = finite(result.metadata.get("format", {}).get("duration", 0) or 0, "影片时长")
     base = materialize_subtitle(result.subtitles[subtitle_index], result.video, progress=progress, duration=length)
+    save_new(result.workspace / "selected-subtitle.ass", base.dumps(), progress, "缓存所选字幕到本机")
     progress("正在排列弹幕并合并台词…")
     if result.dm_ass is not None:
         dm = copy.deepcopy(result.dm_ass)
@@ -1074,12 +1224,69 @@ def synthesize(result, subtitle_index=0, offset=0, density=8, duration=8, font_s
     progress("合并台词和弹幕")
     final = merge_ass(base, dm)
     target = result.video.with_name(result.video.stem + "-字幕加弹幕.ass")
-    progress("正在写入影片原目录…")
+    output = save_new(result.workspace / "字幕加弹幕.ass", final.dumps(), progress, "在本机保存合成字幕")
+    value = {"output": str(output), "local_output": str(output), "video": str(result.video),
+             "signature": result.signature, "target": str(target), "subtitle_lines": len(base.events),
+             "danmaku_lines": len(dm.events), "filtered": filtered}
+    return publish_cached(value, progress)
+
+
+def publish_cached(value, progress=lambda _: None):
+    value = dict(value, saved=False, write_error="")
+    value["output"] = value["local_output"]
     try:
-        output = save_new(target, final.dumps(), progress=progress)
-    except OSError as exc:
-        raise ToolError("无法写入影片原目录，请检查 NAS 是否在线、此目录是否有新建文件权限。原文件未覆盖。") from exc
-    return {"output": str(output), "subtitle_lines": len(base.events), "danmaku_lines": len(dm.events), "filtered": filtered}
+        progress("本地合成已完成，检查 NAS 后写回…")
+        if file_signature(value["video"]) != tuple(value["signature"]):
+            raise ToolError("影片在识别后发生了变化，请重新识别；本地结果已保留，未写回。")
+        output = copy_to_video_dir(Path(value["local_output"]), Path(value["target"]), progress)
+    except (OSError, ToolError) as exc:
+        value["write_error"] = str(exc)
+        progress("本地结果已保留，NAS 写回未完成，可重试写回")
+        return value
+    value.update(output=str(output), saved=True)
+    return value
+
+
+def copy_to_video_dir(source, target, progress=None):
+    total = source.stat().st_size
+    message = "写回影片原目录"
+    report(progress, message, 0, total, "字节")
+    # 先上传 .part，完整关闭后才发布为 ASS；断线不会暴露半份字幕。
+    temporary = target.with_name(".nas-danmaku-" + uuid.uuid4().hex + ".part")
+    created = False
+    try:
+        with source.open("rb") as incoming, temporary.open("xb") as outgoing:
+            created = True
+            copied = 0
+            while chunk := incoming.read(65536):
+                offset = 0
+                while offset < len(chunk):
+                    count = outgoing.write(chunk[offset:])
+                    if not count:
+                        raise OSError("NAS 写入中断。")
+                    offset += count
+                    copied += count
+                    report(progress, message, copied, total, "字节")
+            if copied != total:
+                raise ToolError("本地合成文件大小发生变化，未发布到 NAS。")
+        for version in range(1, 10000):
+            candidate = target if version == 1 else target.with_name(f"{target.stem}-v{version}{target.suffix}")
+            try:
+                if os.name == "nt":
+                    temporary.rename(candidate)  # Windows rename 不覆盖已有目标。
+                else:
+                    os.link(temporary, candidate)  # POSIX 原子发布且拒绝覆盖。
+            except FileExistsError:
+                continue
+            report(progress, message, total, total, "字节", complete=True)
+            return candidate
+        raise ToolError("同名版本文件过多，请整理影片目录。")
+    finally:
+        if created:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass  # 断线残留 .part 不影响本机成果；播放器不会将其当作字幕。
 
 # ---- 一个窗口：选择、展示、确认合成 ----
 
@@ -1119,6 +1326,7 @@ class App:
         root.geometry("860x650")
         root.minsize(780, 620)
         self.result = None
+        self.pending_output = None
         self.busy = False
         self.tasks = queue.Queue()
         self.active_progress = None
@@ -1168,6 +1376,8 @@ class App:
         self.sub_box.pack(side="left", fill="x", expand=True)
         self.manual_sub = ttk.Button(box, text="补选字幕…", command=self.pick_subtitle)
         self.manual_sub.pack(side="left", padx=(8, 0))
+        self.embedded_button = ttk.Button(box, text="使用内封", command=self.use_embedded)
+        self.embedded_button.pack(side="left", padx=(6, 0))
         box = ttk.LabelFrame(p, text="找到的电影弹幕", padding=10)
         box.pack(fill="x", pady=5)
         row = ttk.Frame(box)
@@ -1187,8 +1397,12 @@ class App:
         ttk.Spinbox(row, from_=1, to=30, textvariable=self.density, width=5).pack(side="left", padx=6)
         ttk.Label(row, text="条").pack(side="left")
         ttk.Label(p, textvariable=self.output_text, wraplength=790).pack(anchor="w", pady=(0, 8))
-        self.generate_button = ttk.Button(p, text="确认合成 → 保存到影片原目录", command=self.generate, state="disabled")
-        self.generate_button.pack(fill="x")
+        row = ttk.Frame(p)
+        row.pack(fill="x")
+        self.generate_button = ttk.Button(row, text="确认合成 → 本机合成后写回影片目录", command=self.generate, state="disabled")
+        self.generate_button.pack(side="left", fill="x", expand=True)
+        self.retry_copy_button = ttk.Button(row, text="重试写回 NAS", command=self.retry_copy, state="disabled")
+        self.retry_copy_button.pack(side="left", padx=(6, 0))
         self.progress_bar = ttk.Progressbar(p, mode="determinate", maximum=100)
         self.progress_bar.pack(fill="x", pady=(6, 6))
         ttk.Label(p, textvariable=self.status, wraplength=790).pack(anchor="w")
@@ -1228,7 +1442,7 @@ class App:
     def set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy else "normal"
-        for widget in (self.path_entry, self.title_entry, self.browse_button, self.scan_button, self.retry_button, self.manual_sub, self.manual_dm):
+        for widget in (self.path_entry, self.title_entry, self.browse_button, self.scan_button, self.retry_button, self.manual_sub, self.manual_dm, self.embedded_button):
             widget.configure(state=state)
         self.sub_box.configure(state="disabled" if busy else "readonly")
         self.movie_box.configure(state="disabled" if busy else "readonly")
@@ -1241,6 +1455,7 @@ class App:
     def update_ready(self):
         ready = not self.busy and self.result is not None and bool(self.result.subtitles) and bool(self.result.comments or self.result.dm_ass)
         self.generate_button.configure(state="normal" if ready else "disabled")
+        self.retry_copy_button.configure(state="normal" if not self.busy and self.pending_output else "disabled")
 
     def background(self, work, done):
         if self.busy:
@@ -1307,6 +1522,7 @@ class App:
             return self.browse()
         title = self.title.get() if override else ""
         self.result = None
+        self.pending_output = None
         self.sub_box.configure(values=[])
         self.movie_box.configure(values=[])
         self.subtitle.set("正在识别…")
@@ -1318,7 +1534,8 @@ class App:
             self.path.set(str(result.video))
             self.title.set(result.identity["title"])
             length = float(result.metadata.get("format", {}).get("duration", 0) or 0)
-            self.identity_text.set(f"{result.identity['source']}识别 · 年份：{result.identity['year'] or '未知'} · 影片约 {length / 60:.1f} 分钟")
+            length_text = f"约 {length / 60:.1f} 分钟" if length else "未知"
+            self.identity_text.set(f"{result.identity['source']}识别 · 年份：{result.identity['year'] or '未知'} · 片长：{length_text}")
             self.sub_box.configure(values=[c.label for c in result.subtitles])
             if result.subtitles:
                 self.sub_box.current(0)
@@ -1333,6 +1550,7 @@ class App:
             self.output_text.set("输出到：" + str(result.video.with_name(result.video.stem + "-字幕加弹幕.ass")))
             for warning in result.warnings:
                 self.log("提示：" + warning)
+            self.log("本地缓存：" + str(result.workspace))
             self.status.set("已找到字幕和弹幕，请核对后确认合成。" if result.subtitles and (result.comments or result.dm_ass) else "识别结束，仍有缺失项，请查看提示。")
         self.background(lambda: scan_movie(path, title, self.progress), done)
 
@@ -1357,7 +1575,26 @@ class App:
             r.comments, r.danmaku_source, r.danmaku_url = value
             self.show_danmaku()
             self.status.set("已取得新候选的弹幕，请核对字幕后确认。")
-        self.background(lambda: fetch_public_danmaku(r.movies[index], self.progress), done)
+        def work():
+            value = fetch_public_danmaku(r.movies[index], self.progress)
+            r.comments, r.danmaku_source, r.danmaku_url = value
+            cache_danmaku(r, self.progress)
+            return value
+        self.background(work, done)
+
+    def use_embedded(self):
+        if self.busy or self.result is None:
+            return
+        choices = embedded_choices(self.result.metadata)
+        if not choices:
+            return messagebox.showinfo("无可用内封文字字幕", "未发现可用内封文字轨，请补选 SRT/ASS。PGS/SUP 图片字幕需要先 OCR。")
+        for choice in choices:
+            choice.label += "（需读取影片，异地较慢）"
+        self.result.subtitles = choices + [c for c in self.result.subtitles if c.kind != "embedded"]
+        self.sub_box.configure(values=[c.label for c in self.result.subtitles])
+        self.sub_box.current(0)
+        self.status.set("已手动选择内封字幕；确认合成时需要扫描影片，异地可能较慢。")
+        self.update_ready()
 
     def pick_subtitle(self):
         if not self.result:
@@ -1365,8 +1602,10 @@ class App:
         path = filedialog.askopenfilename(title="补选原台词字幕", filetypes=[("文字字幕", "*.srt *.ass")])
         if path:
             try:
-                load_subtitle(path)
-                self.result.subtitles.insert(0, SubtitleChoice("手动补选 · " + Path(path).name, "file", 999, path))
+                if self.result.workspace is None:
+                    self.result.workspace = local_workspace()
+                choice = SubtitleChoice("手动补选 · " + Path(path).name, "file", 999, path)
+                self.result.subtitles.insert(0, cache_subtitle(choice, self.result.workspace))
                 self.sub_box.configure(values=[c.label for c in self.result.subtitles])
                 self.sub_box.current(0)
                 self.update_ready()
@@ -1386,6 +1625,7 @@ class App:
                     self.result.comments, _ = parse_comments(read_text(path))
                     self.result.dm_ass = None
                 self.result.danmaku_source = "手动补选 · " + Path(path).name
+                cache_danmaku(self.result)
                 self.movie.set(self.result.danmaku_source)
                 self.show_danmaku()
                 self.update_ready()
@@ -1397,19 +1637,37 @@ class App:
         if self.busy or r is None:
             return
         try:
-            current = normalize_path(self.path.get().strip().strip('"'))
-            if current != r.video:
+            current = os.path.normcase(os.path.abspath(self.path.get().strip().strip('"')))
+            if current != os.path.normcase(str(r.video)):
                 raise ToolError("路径已经改变，请点击“识别”重新读取后再合成。")
             index = self.sub_box.current()
             offset, density = finite(self.offset.get()), int(self.density.get())
         except (ToolError, ValueError, OSError) as exc:
             return messagebox.showerror("请检查输入", str(exc))
-        def done(value):
+        self.background(lambda: synthesize(r, index, offset, density, progress=self.progress), self.show_output)
+
+    def show_output(self, value):
+        self.log(f"台词 {value['subtitle_lines']} 行，弹幕 {value['danmaku_lines']} 条；限流/去重 {value['filtered']} 条。")
+        if value.get("saved", True):
+            self.pending_output = None
             self.status.set("合成完成，已保存到影片原目录。")
             self.output_text.set("已保存：" + value["output"])
-            self.log(f"台词 {value['subtitle_lines']} 行，弹幕 {value['danmaku_lines']} 条；限流/去重 {value['filtered']} 条。")
             messagebox.showinfo("合成完成", value["output"] + "\n\n在极影视中选择这条“字幕加弹幕”字幕即可。")
-        self.background(lambda: synthesize(r, index, offset, density, progress=self.progress), done)
+        else:
+            self.pending_output = value
+            self.status.set("本机合成成功，NAS 写回未完成。恢复连接后点“重试写回 NAS”。")
+            self.output_text.set("本地成品：" + value["local_output"])
+            self.progress_bar["value"] = 0
+            self.progress_text.set("本地成品已保留 · 等待写回 NAS")
+            self.log("写回原因：" + value["write_error"])
+            messagebox.showwarning("本地完成，等待写回", "合成字幕已保存在电脑：\n" + value["local_output"] +
+                                   "\n\n" + value["write_error"] + "\n\n恢复 NAS 连接后点“重试写回 NAS”，无需重新下载或合成。")
+        self.update_ready()
+
+    def retry_copy(self):
+        if not self.busy and self.pending_output:
+            value = self.pending_output
+            self.background(lambda: publish_cached(value, self.progress), self.show_output)
 
 
 def main(argv=None):

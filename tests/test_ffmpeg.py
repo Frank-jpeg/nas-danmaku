@@ -10,6 +10,13 @@ import nas_danmaku as d
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), '需要 FFmpeg 和 ffprobe')
 class FFmpegTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        fixture = patch.object(d, 'local_workspace', side_effect=lambda: Path(tempfile.mkdtemp(dir=tmp.name)))
+        fixture.start()
+        self.addCleanup(fixture.stop)
+
     def test_generated_video_extract_merge_and_pgs_guard(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp).resolve()

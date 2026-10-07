@@ -1,5 +1,6 @@
 from pathlib import Path
 import copy
+import gc
 import importlib.util
 import json
 import shutil
@@ -11,6 +12,8 @@ import unittest
 from unittest.mock import patch
 
 import nas_danmaku as d
+
+REAL_ONLINE_SUBTITLES = d.online_subtitles
 
 SRT = '1\n00:00:02,000 --> 00:00:20,000\n这是原台词字幕\n'
 
@@ -40,6 +43,13 @@ class AutoTests(unittest.TestCase):
         extract.start()
         self.addCleanup(probe.stop)
         self.addCleanup(extract.stop)
+        cache = patch.object(d, 'local_workspace', side_effect=lambda: Path(tempfile.mkdtemp(dir=self.folder)))
+        titles = patch.object(d, 'title_subtitles', return_value=[])
+        online = patch.object(d, 'online_subtitles', return_value=[])
+        for fixture in (cache, titles, online):
+            fixture.start()
+            self.addCleanup(fixture.stop)
+        # 保留真实在线解析函数，单独测试时使用。
 
     def tearDown(self):
         self.temp.cleanup()
@@ -72,16 +82,18 @@ class AutoTests(unittest.TestCase):
         choices = d.embedded_choices({'streams': streams})
         self.assertEqual([c.index for c in choices], [1, 3])
 
-    def test_chinese_embedded_skips_online_subtitle_request(self):
-        with patch.object(d, 'online_subtitles') as online:
+    def test_chinese_embedded_does_not_skip_online_subtitle_request(self):
+        candidate = d.SubtitleChoice('在线测试', 'online', 100, doc=d.parse_srt(SRT))
+        with patch.object(d, 'title_subtitles', return_value=[candidate]) as online:
             choices, errors = d.discover_subtitles(self.video, self.meta, lambda _: None)
-        online.assert_not_called()
-        self.assertEqual(choices[0].kind, 'embedded')
+        online.assert_called_once()
+        self.assertEqual(choices[0].kind, 'online')
+        self.assertFalse(any(c.kind == 'embedded' for c in choices))
 
     def test_online_subtitle_search_and_delay(self):
         replies = [json.dumps([{'Desc': '中文', 'Delay': 1500, 'Files': [{'Ext': 'srt', 'Link': 'https://example.com/sub.srt'}]}]).encode(), SRT.encode()]
         with patch.object(d, 'web_bytes', side_effect=replies) as web:
-            choices = d.online_subtitles(self.video)
+            choices = REAL_ONLINE_SUBTITLES(self.video)
         self.assertEqual(choices[0].delay, 1.5)
         self.assertEqual(len(choices[0].doc.events), 1)
         # 不把用户目录发往字幕源
@@ -92,7 +104,7 @@ class AutoTests(unittest.TestCase):
 
     def test_no_online_subtitle_is_not_success(self):
         with patch.object(d, 'web_bytes', return_value=b'\xff'):
-            self.assertEqual(d.online_subtitles(self.video), [])
+            self.assertEqual(REAL_ONLINE_SUBTITLES(self.video), [])
 
     def test_hash_four_ranges(self):
         import hashlib
@@ -134,9 +146,10 @@ class AutoTests(unittest.TestCase):
     def test_full_scan_then_confirm_original_dir(self):
         data = copy.deepcopy(SEARCH_REPLY)
         comments = [d.Comment(4, '测试弹幕')]
-        with patch.object(d, 'web_json', return_value=data), patch.object(d, 'fetch_public_danmaku', return_value=(comments, '测试源', 'https://v.qq.com/test')):
+        candidate = d.SubtitleChoice('在线测试', 'online', 100, doc=d.parse_srt(SRT))
+        with patch.object(d, 'title_subtitles', return_value=[candidate]), patch.object(d, 'web_json', return_value=data), patch.object(d, 'fetch_public_danmaku', return_value=(comments, '测试源', 'https://v.qq.com/test')):
             result = d.scan_movie(self.video)
-        self.assertEqual(result.subtitles[0].kind, 'embedded')
+        self.assertEqual(result.subtitles[0].kind, 'online')
         self.assertFalse(list(self.folder.glob('*字幕加弹幕*')), '确认前不能写输出')
         before = self.video.read_bytes()
         output = d.synthesize(result)
@@ -153,15 +166,18 @@ class AutoTests(unittest.TestCase):
         with self.assertRaisesRegex(d.ToolError, '文字字幕'):
             d.synthesize(result)
         self.video.write_bytes(self.video.read_bytes() + b'changed')
-        with self.assertRaisesRegex(d.ToolError, '发生了变化'):
-            d.synthesize(result)
+        result.subtitles = [d.SubtitleChoice('cached', 'online', doc=d.parse_srt(SRT))]
+        output = d.synthesize(result)
+        self.assertFalse(output['saved'])
+        self.assertIn('发生了变化', output['write_error'])
+        self.assertFalse(list(self.folder.glob('*字幕加弹幕*')))
 
     def test_hidden_gui_analyze_confirm_and_stale_path(self):
         try:
             root = tk.Tk()
         except tk.TclError:
             self.skipTest('没有可用的 Tk 显示环境')
-        self.addCleanup(root.destroy)
+        self.addCleanup(lambda: (root.destroy(), gc.collect()))
         root.withdraw()
         app = d.App(root); root.update_idletasks()
         self.assertLessEqual(root.winfo_reqheight(), 690)

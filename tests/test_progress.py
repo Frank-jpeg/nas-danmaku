@@ -150,7 +150,8 @@ class GuiProgressTests(unittest.TestCase):
         self.assertEqual(str(app.progress_bar['mode']), 'determinate')
         app.apply_progress(d.ProgressUpdate('下载弹幕', 25, 100, '字节'))
         log_before = app.log_box.get('1.0', 'end')
-        with patch.object(d.time, 'monotonic', return_value=app.step_started + 60):
+        # 避开浮点减法的整秒边界，某些 Windows 时钟会得到 59.999999 秒。
+        with patch.object(d.time, 'monotonic', return_value=app.step_started + 60.5):
             app.refresh_progress_time()
         self.assertEqual(float(app.progress_bar['value']), 25)
         self.assertIn('00:01:00', app.progress_text.get())

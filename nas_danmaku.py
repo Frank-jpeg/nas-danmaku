@@ -31,13 +31,14 @@ import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.3.1"
+VERSION = "2.4.0"
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
 TEXT_CODECS = {"ass", "ssa", "subrip", "srt", "mov_text", "text", "webvtt"}
 DM_DEFAULTS = dict(font_size=32, duration=8, area=25, opacity=80, block_scroll=False,
-                   block_fixed=True, block_color=False, avoid_subtitles=True, deduplicate=True)
+                   block_fixed=True, block_color=False, avoid_subtitles=True, deduplicate=True,
+                   block_noise=True, block_keywords="")
 
 
 class ToolError(Exception):
@@ -424,9 +425,105 @@ def parse_comments(text):
     return comments, skipped
 
 
+_NOISE_FOLD = str.maketrans("觀看簽報時現與幾來還嗎誰號個這後愛帶著們", "观看签报时现与几来还吗谁号个这后爱带着们")
+_CN_NUMBER = r"[零〇一二三四五六七八九十两\d]{1,4}"
+_DATE_TOKEN = re.compile(
+    rf"(?<!\d)(?:(?:19|20)\d{{2}}[./-]\d{{1,2}}[./-]\d{{1,2}}|"
+    rf"(?:19|20)\d{{2}}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])|"
+    rf"(?:{_CN_NUMBER}年)?{_CN_NUMBER}月(?:{_CN_NUMBER}[日号]?)?)")
+_YEAR_TOKEN = re.compile(r"(?<!\d)(?:(?:19|20)\d{2}|[二零〇一三四五六七八九]{4})年?(?!\d)")
+_TIME_TOKEN = re.compile(rf"(?<!\d)(?:(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?|"
+                         rf"{_CN_NUMBER}(?:点|时)(?:{_CN_NUMBER}分?)?(?:{_CN_NUMBER}秒)?)(?!\d)")
+_WATCH_WORDS = re.compile(
+    rf"(?:现在|今天|此刻|观看时间|北京时间|时间|凌晨|早上|上午|中午|下午|晚上|半夜|深夜|"
+    rf"记录一下|记录|纪念|留念|打卡|签到|签个到|报到|报道|到此一游|留个脚印|路过|"
+    rf"刚刚|刚|开始|正在|已经|终于|第一次|第{_CN_NUMBER}次|{_CN_NUMBER}刷|重温|补番|补课|"
+    rf"看到这里|看完|观看|看过|看|刷|来过|来了|有人|多少人|一起|一个人|我|本人|于|是|在|还|又|也|都|"
+    rf"才|有|人|谁|来|到|这|的|了|吗|呢|啊|呀|哦|喽|啦|没|嘞)")
+_PRESENCE = re.compile(
+    r"(?:在吗|在不在|有人吗|有人在吗|还有人吗|还有人在吗|还有人在看吗|还有人看吗|有人在看吗|"
+    r"有人看吗|有人一起看吗|还有人看的吗|还有人看|谁还在看|谁在看|谁在看呀|有活人吗|活人扣1|"
+    r"有人的扣1|在的扣1|在的举个手|举个手|吱一声|吱个声|冒个泡|冒泡|前排|抢沙发|沙发|第一|"
+    r"来了|集合|集合啦|占个座|打卡|签到|报到|到此一游|路过|留个脚印){1,8}")
+_COMPANION = re.compile(
+    rf"(?:今天|这次|现在|正在|准备|第一次|我|本人|想|要|又|也|是|正|刚){{0,8}}"
+    r"(?:和|跟|与|陪|陪着|带|带着|带上)[\w]{1,16}"
+    r"(?:一起|一块|在|正在|来|陪我){0,3}(?:观看|看过|看完|看|重温|刷)"
+    rf"(?:这部电影|这部|电影|影片|片子|的|呢|啦|啊|呀|了|中|一遍|第{_CN_NUMBER}遍){{0,6}}")
+_PROMOTION = re.compile(r"(?:加|进)(?:qq|微信|粉丝)群|(?:微信|vx|v信|qq)(?:号|群|同号)?[:：]?[a-z0-9_-]{5,}|"
+                        r"扫码(?:领取|领红包|加群)|(?:互粉|刷赞|代刷播放)|关注我(?:领取|领|看全集)|私信我(?:领|获取)")
+_REPEATED_ASCII = re.compile(r"([a-z0-9]{1,3})\1{5,}")
+
+
+def filter_text(text):
+    """只规范化用于匹配的副本，不修改显示内容、缓存或原台词。"""
+    text = unicodedata.normalize("NFKC", str(text)).casefold().translate(_NOISE_FOLD)
+    return "".join(c for c in text if not c.isspace() and unicodedata.category(c) not in {"Cf", "Cc"})
+
+
+def compile_block_keywords(text):
+    if not isinstance(text, str) or len(text) > 10000:
+        raise ToolError("自定义屏蔽词最多 10000 个字符，每行一个。")
+    words = []
+    for line in text.splitlines():
+        word = filter_text(line.strip())
+        if not word:
+            continue
+        if len(word) > 80:
+            raise ToolError("每个屏蔽词最多 80 个字符。")
+        if word not in words:
+            words.append(word)
+    if len(words) > 100:
+        raise ToolError("自定义屏蔽词最多 100 条。")
+    return tuple(words)
+
+
+def watch_sentence(text):
+    # 有人/有+人等存在多种切分；用有界动态规划，避免重复正则回溯拖慢合成。
+    reachable = {0}
+    for start in range(len(text)):
+        if start in reachable:
+            for end in range(start + 1, min(len(text), start + 10) + 1):
+                if _WATCH_WORDS.fullmatch(text[start:end]):
+                    reachable.add(end)
+    return len(text) in reachable
+
+
+def blocked_comment_reason(text, enabled=True, keywords=()):
+    normal = filter_text(text)
+    if any(word in normal for word in keywords):
+        return "自定义关键词"
+    if not enabled:
+        return ""
+    plain = "".join(c for c in normal if c.isalnum())
+    if _REPEATED_ASCII.fullmatch(plain):
+        return "重复字符刷屏"
+    # 内置规则针对短打卡/闲聊句式，避免把较长的剧情分析当成打卡。
+    if len(normal) > 180:
+        return ""
+    if _PROMOTION.search(normal):
+        return "广告引流"
+    if _PRESENCE.fullmatch(plain):
+        return "打卡或找人聊天"
+    if _COMPANION.fullmatch(plain):
+        return "陪同观看打卡"
+    has_date = _DATE_TOKEN.search(normal) is not None
+    has_time = _TIME_TOKEN.search(normal) is not None
+    has_year = _YEAR_TOKEN.search(normal) is not None
+    without_stamps = _TIME_TOKEN.sub("", _YEAR_TOKEN.sub("", _DATE_TOKEN.sub("", normal)))
+    remainder = "".join(c for c in without_stamps if c.isalnum())
+    if (has_date or has_time or (has_year and remainder)) and watch_sentence(remainder):
+        return "日期或时间打卡"
+    if (has_date or has_time or has_year) and _COMPANION.fullmatch(remainder):
+        return "陪同观看打卡"
+    if plain and re.search(r"打卡|签到|报到|第.{1,4}次|.{1,4}刷", plain) and watch_sentence(plain):
+        return "观看打卡"
+    return ""
+
+
 def render_comments(comments, resolution, offset=0, density=6, duration=8, font_size=32, progress=None,
                     *, area=25, opacity=80, block_scroll=False, block_fixed=True, block_color=False,
-                    avoid_subtitles=True, deduplicate=True):
+                    avoid_subtitles=True, deduplicate=True, block_noise=True, block_keywords="", filter_stats=None):
     width, height = resolution
     offset, duration, font_size = finite(offset, "弹幕偏移"), finite(duration, "滚动时长"), finite(font_size, "字号")
     density, area, opacity = finite(density, "同屏条数"), finite(area, "显示区域"), finite(opacity, "不透明度")
@@ -434,6 +531,9 @@ def render_comments(comments, resolution, offset=0, density=6, duration=8, font_
         raise ToolError("同屏条数范围 1–30，滚动时长 2–20 秒，字号 16–100（以 1080p 为基准）。")
     if not 10 <= area <= 100 or not 10 <= opacity <= 100:
         raise ToolError("显示区域和不透明度范围均为 10–100%。")
+    keywords = compile_block_keywords(block_keywords)
+    if filter_stats is not None:
+        filter_stats.update(noise=0, keywords=0)
     size = font_size * height / 1080
     top, row_height = height * .025, size * 1.45
     bottom = height * min(area / 100, .68 if avoid_subtitles else 1)
@@ -464,6 +564,12 @@ def render_comments(comments, resolution, offset=0, density=6, duration=8, font_
         fixed = comment.mode in (4, 5)
         if (fixed and block_fixed) or (not fixed and block_scroll) or (block_color and comment.color != 0xFFFFFF):
             omitted += 1
+            continue
+        reason = blocked_comment_reason(comment.text, block_noise, keywords)
+        if reason:
+            omitted += 1
+            if filter_stats is not None:
+                filter_stats["keywords" if reason == "自定义关键词" else "noise"] += 1
             continue
         message = escape_text(comment.text)[:120]
         if original_at < 0 or (deduplicate and message in seen and at - seen[message] < 15):
@@ -695,6 +801,9 @@ NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS
 弹幕偏移：正数延后、负数提前。不同剪辑版本可能无法只用一个偏移完全对齐。
 默认弹幕只在顶部 1/4 滚动，字号 32（1080p 基准）、不透明度 80%、最多同屏 6 条，屏蔽固定弹幕。
 同向弹幕留够安全间距即可接续进入，按同屏上限分散进入节奏，不再等待整批走完；原时间点不后移。
+默认过滤日期/时间打卡、报几刷、陪谁看、在吗/有人吗、重复字母数字及明显广告；“弹幕设置”可关闭。
+可在“自定义屏蔽词”每行填一个普通词，包含该词的弹幕会被过滤；自定义词独立于内置过滤开关。
+过滤发生在合成时，仅影响在线/XML/JSON 弹幕；原始缓存和台词不变，日志显示屏蔽数量。
 “弹幕设置”可调显示区域、字号、不透明度、速度及类型过滤；只影响弹幕，不改原台词字幕。
 勾选防挡字幕时，即使放大区域也会保留底部 32%；固定弹幕手动开启后同样限制在所选区域内。
 设置保留在当前窗口，重新启动恢复默认。调整后点确认合成，无需重新下载；已有 ASS 不会自动改变。
@@ -1503,7 +1612,7 @@ def materialize_subtitle(choice, video, progress=None, duration=None):
 
 def synthesize(result, subtitle_index=0, offset=0, density=6, duration=8, font_size=32, progress=lambda _: None,
                *, area=25, opacity=80, block_scroll=False, block_fixed=True, block_color=False,
-               avoid_subtitles=True, deduplicate=True):
+               avoid_subtitles=True, deduplicate=True, block_noise=True, block_keywords=""):
     if not result.subtitles or not 0 <= subtitle_index < len(result.subtitles):
         raise ToolError("还没有可合成的文字字幕。")
     if not result.comments and result.dm_ass is None:
@@ -1518,6 +1627,7 @@ def synthesize(result, subtitle_index=0, offset=0, density=6, duration=8, font_s
     base = materialize_subtitle(result.subtitles[subtitle_index], result.video, progress=progress, duration=length)
     save_new(result.workspace / "selected-subtitle.ass", base.dumps(), progress, "缓存所选字幕到本机")
     progress("正在排列弹幕并合并台词…")
+    filter_stats = dict(noise=0, keywords=0)
     if result.dm_ass is not None:
         dm = copy.deepcopy(result.dm_ass)
         shift_events(dm, offset, is_danmaku=True)
@@ -1527,7 +1637,8 @@ def synthesize(result, subtitle_index=0, offset=0, density=6, duration=8, font_s
         comments = [c for c in result.comments if not length or c.time + shift < length]
         dm, filtered = render_comments(comments, base.resolution, offset, density, duration, font_size, progress=progress,
                                        area=area, opacity=opacity, block_scroll=block_scroll, block_fixed=block_fixed,
-                                       block_color=block_color, avoid_subtitles=avoid_subtitles, deduplicate=deduplicate)
+                                       block_color=block_color, avoid_subtitles=avoid_subtitles, deduplicate=deduplicate,
+                                       block_noise=block_noise, block_keywords=block_keywords, filter_stats=filter_stats)
         filtered += len(result.comments) - len(comments)
     progress("合并台词和弹幕")
     final = merge_ass(base, dm)
@@ -1535,7 +1646,8 @@ def synthesize(result, subtitle_index=0, offset=0, density=6, duration=8, font_s
     output = save_new(result.workspace / target.name, final.dumps(), progress, "在本机保存合成字幕")
     value = {"output": str(output), "local_output": str(output), "video": str(result.video),
              "signature": result.signature, "target": str(target), "subtitle_lines": len(base.events),
-             "danmaku_lines": len(dm.events), "filtered": filtered}
+             "danmaku_lines": len(dm.events), "filtered": filtered,
+             "noise_filtered": filter_stats["noise"], "keyword_filtered": filter_stats["keywords"]}
     return publish_cached(value, progress)
 
 
@@ -1633,11 +1745,12 @@ class DanmakuSettingsDialog:
         self.window = tk.Toplevel(app.root)
         self.window.title("弹幕设置")
         self.window.resizable(False, False)
-        frame = ttk.Frame(self.window, padding=16)
+        frame = ttk.Frame(self.window, padding=12)
         frame.pack(fill="both", expand=True)
         current = app.render_settings
         self.variables = {key: tk.BooleanVar(value=current[key]) for key in
-                          ("block_scroll", "block_fixed", "block_color", "avoid_subtitles", "deduplicate")}
+                          ("block_scroll", "block_fixed", "block_color", "avoid_subtitles", "deduplicate", "block_noise")}
+        self.variables["block_keywords"] = tk.StringVar(value=current["block_keywords"])
         self.variables.update({key: tk.DoubleVar(value=current[key]) for key in ("area", "opacity", "font_size")})
         self.variables["speed"] = tk.DoubleVar(value=800 / current["duration"])
         self.variables["density"] = tk.StringVar(value=app.density.get())
@@ -1653,10 +1766,15 @@ class DanmakuSettingsDialog:
         row.pack(fill="x", pady=(6, 10))
         for key, label in (("avoid_subtitles", "防挡字幕（保留底部 32%）"), ("deduplicate", "过滤重复弹幕")):
             ttk.Checkbutton(row, text=label, variable=self.variables[key], command=self.preview).pack(side="left", padx=(0, 12))
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(0, 4))
+        ttk.Checkbutton(row, text="过滤垃圾弹幕（打卡、报时、闲聊等）", variable=self.variables["block_noise"]).pack(side="left")
+        self.keyword_button = ttk.Button(row, text="自定义屏蔽词…", command=self.edit_keywords)
+        self.keyword_button.pack(side="right")
         for key, label, low, high in (("area", "显示区域", 10, 100), ("opacity", "不透明度", 10, 100),
                                       ("font_size", "弹幕字号", 16, 64), ("speed", "弹幕速度", 50, 200)):
             row = ttk.Frame(frame)
-            row.pack(fill="x", pady=5)
+            row.pack(fill="x", pady=3)
             ttk.Label(row, text=label, width=10).pack(side="left")
             ttk.Scale(row, from_=low, to=high, variable=self.variables[key], command=lambda _: self.preview()).pack(side="left", fill="x", expand=True, padx=10)
             self.labels[key] = tk.StringVar()
@@ -1683,7 +1801,33 @@ class DanmakuSettingsDialog:
             settings[key] = round(settings[key])
         settings["duration"] = 800 / finite(self.variables["speed"].get(), "速度")
         density = int(self.variables["density"].get())
+        compile_block_keywords(settings["block_keywords"])
         return settings, density
+
+    def edit_keywords(self):
+        win = tk.Toplevel(self.window)
+        win.title("自定义弹幕屏蔽词")
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="每行一个词，包含该词的整条弹幕将被屏蔽；按普通文字匹配，不用写正则。", wraplength=480).pack(anchor="w")
+        ttk.Label(frame, text="内置：日期/时间打卡、报几刷、陪谁看、在吗/有人吗、重复字符、广告引流。", wraplength=480).pack(anchor="w", pady=6)
+        editor = tk.Text(frame, width=54, height=10, wrap="word", font=("Microsoft YaHei UI", 10))
+        editor.pack(fill="both", expand=True)
+        editor.insert("1.0", self.variables["block_keywords"].get())
+        notice = tk.StringVar(value="最多 100 条，每条 80 字。当前窗口有效，返回后还需点“应用设置”。")
+        ttk.Label(frame, textvariable=notice, wraplength=480).pack(anchor="w", pady=8)
+        def save():
+            raw = editor.get("1.0", "end-1c")
+            try:
+                words = compile_block_keywords(raw)
+            except ToolError as exc:
+                notice.set(str(exc))
+                return
+            self.variables["block_keywords"].set(raw)
+            self.keyword_button.configure(text=f"自定义屏蔽词 · {len(words)} 条")
+            win.destroy()
+        ttk.Button(frame, text="确定", command=save).pack(side="right")
+        ttk.Button(frame, text="取消", command=win.destroy).pack(side="right", padx=6)
 
     def preview(self):
         if not hasattr(self, "canvas"):
@@ -1703,7 +1847,8 @@ class DanmakuSettingsDialog:
             canvas.create_text(256, 265, text="原台词字幕 · 样式保持不变", fill="white", font=("Microsoft YaHei UI", -13))
             sample = [Comment(0, "上方滚动弹幕示意"), Comment(0, "弹幕字号与区域比例", 0x7ADDEF),
                       Comment(0, "顶部固定弹幕", mode=5), Comment(0, "底部固定弹幕（仍在显示区域内）", mode=4)]
-            doc, _ = render_comments(sample, (1920, 1080), density=density, **settings)
+            doc, _ = render_comments(sample, (1920, 1080), density=density,
+                                     **dict(settings, block_noise=False, block_keywords=""))
             for number, row in enumerate(doc.events):
                 position = re.search(r"\\(?:move|pos)\([^,]+,([\d.]+)", row["Text"])
                 text_value = re.sub(r"\{[^}]*\}", "", row["Text"])
@@ -1726,6 +1871,7 @@ class DanmakuSettingsDialog:
                 self.variables[key].set(value)
         self.variables["speed"].set(100)
         self.variables["density"].set("6")
+        self.keyword_button.configure(text="自定义屏蔽词…")
         self.preview()
 
     def apply(self):
@@ -1740,7 +1886,8 @@ class DanmakuSettingsDialog:
             if settings["block_scroll"] and settings["block_fixed"]:
                 raise ToolError("滚动和固定不能同时屏蔽，否则没有弹幕可显示。")
             samples = [Comment(0, "检查滚动"), Comment(0, "检查固定", mode=5)]
-            render_comments(samples, (1920, 1080), density=density, **settings)
+            render_comments(samples, (1920, 1080), density=density,
+                            **dict(settings, block_noise=False, block_keywords=""))
         except (ToolError, ValueError, tk.TclError, ZeroDivisionError) as exc:
             self.note.set("请检查设置：" + str(exc))
             return
@@ -2039,7 +2186,7 @@ class App:
         r = self.result
         if r and r.comments:
             snippets = " / ".join(c.text[:28].replace("\n", " ") for c in r.comments[:2])
-            self.dm_text.set(f"已获取 {len(r.comments):,} 条 · {r.danmaku_source}\n预览：{snippets}")
+            self.dm_text.set(f"已获取 {len(r.comments):,} 条 · {r.danmaku_source}\n原始预览（合成时过滤）：{snippets}")
         elif r and r.dm_ass:
             self.dm_text.set(f"已导入 {len(r.dm_ass.events)} 行 ASS 弹幕；保留原字号/密度，画布需与台词相同。")
             self.settings_summary.set("ASS 原有排版（仅偏移）")
@@ -2150,6 +2297,7 @@ class App:
 
     def show_output(self, value):
         self.log(f"台词 {value['subtitle_lines']} 行，弹幕 {value['danmaku_lines']} 条；过滤/去重/限流 {value['filtered']} 条。")
+        self.log(f"其中垃圾弹幕 {value.get('noise_filtered', 0)} 条，自定义屏蔽词 {value.get('keyword_filtered', 0)} 条。")
         if value.get("saved", True):
             self.pending_output = None
             self.status.set("合成完成，已保存到影片原目录。")

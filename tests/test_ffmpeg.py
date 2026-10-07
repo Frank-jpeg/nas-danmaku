@@ -32,10 +32,34 @@ class FFmpegTests(unittest.TestCase):
             result = d.ScanResult(video, {}, meta, d.file_signature(video),
                                   subtitles=d.embedded_choices(meta),
                                   comments=[d.Comment(1, '测试弹幕'), d.Comment(99, '超出片长')])
-            output = d.synthesize(result)
+            updates = []
+            output = d.synthesize(result, progress=updates.append)
+            extraction = [u for u in updates if isinstance(u, d.ProgressUpdate) and u.message == '提取原台词字幕']
+            self.assertTrue(extraction[-1].complete)
+            self.assertGreater(extraction[-1].current, 0)
+            self.assertEqual(extraction[-1].total, float(meta['format']['duration']))
+            self.assertTrue(all(u.percent < 100 for u in extraction[:-1]))
             self.assertEqual(output['subtitle_lines'], 1)
             self.assertEqual(output['danmaku_lines'], 1)
             self.assertEqual(Path(output['output']).parent, folder)
             with patch.object(d, 'subtitle_tracks', return_value=[{'index': 2, 'codec_name': 'hdmv_pgs_subtitle'}]):
                 with self.assertRaisesRegex(d.ToolError, '图片字幕'):
                     d.extract_subtitle(video, 2)
+
+    def test_running_ffmpeg_has_measured_intermediate_progress(self):
+        updates = []
+        d.run_media('ffmpeg', ['-re', '-f', 'lavfi', '-i', 'color=s=32x32:r=10:d=1.5',
+                               '-f', 'null', '-'], progress=updates.append, duration=1.5, timeout=10)
+        positions = {u.current for u in updates if not u.complete and 0 < u.current < 1.5}
+        self.assertGreaterEqual(len(positions), 2)
+        self.assertTrue(updates[-1].complete)
+
+    def test_ffmpeg_failure_and_timeout_never_report_completion(self):
+        cases = [(['-this-option-does-not-exist'], 10),
+                 (['-re', '-f', 'lavfi', '-i', 'color=s=32x32:r=10:d=5', '-f', 'null', '-'], .15)]
+        for args, timeout in cases:
+            with self.subTest(args=args):
+                updates = []
+                with self.assertRaises(d.ToolError):
+                    d.run_media('ffmpeg', args, progress=updates.append, duration=5, timeout=timeout)
+                self.assertFalse(any(u.complete for u in updates))

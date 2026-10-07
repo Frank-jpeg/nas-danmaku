@@ -35,7 +35,7 @@ class AutoTests(unittest.TestCase):
         self.meta = {'streams': [{'index': 1, 'codec_type': 'subtitle', 'codec_name': 'ass', 'tags': {'language': 'chi'}}], 'format': {'duration': '60'}}
         # 文件探测和字幕提取单独由 FFmpeg 集成测试覆盖。
         probe = patch.object(d, 'inspect_video', return_value=self.meta)
-        extract = patch.object(d, 'extract_subtitle', side_effect=lambda *_: d.parse_srt(SRT))
+        extract = patch.object(d, 'extract_subtitle', side_effect=lambda *_, **__: d.parse_srt(SRT))
         probe.start()
         extract.start()
         self.addCleanup(probe.stop)

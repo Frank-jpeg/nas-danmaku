@@ -7,6 +7,7 @@ import base64
 import copy
 import hashlib
 import html
+import http.client
 import json
 import math
 import os
@@ -23,7 +24,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
@@ -32,6 +33,29 @@ TEXT_CODECS = {"ass", "ssa", "subrip", "srt", "mov_text", "text", "webvtt"}
 
 class ToolError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class ProgressUpdate:
+    message: str
+    current: float | None = None
+    total: float | None = None
+    unit: str = ""
+    complete: bool = False
+
+    @property
+    def percent(self):
+        if self.complete:
+            return 100.0
+        if self.current is None or self.total is None or self.total <= 0:
+            return None
+        # 满量后仍可能在等待进程退出/文件关闭；成功返回前不显示完成。
+        return max(0.0, min(99.9, self.current / self.total * 100))
+
+
+def report(progress, message, current=None, total=None, unit="", complete=False):
+    if progress is not None:
+        progress(ProgressUpdate(message, current, total, unit, complete))
 
 
 def normalize_path(value):
@@ -240,10 +264,12 @@ def load_subtitle(path):
     raise ToolError("原字幕请选择 .srt 或 .ass。PGS/SUP 图片字幕需要先 OCR 或找文字字幕。")
 
 
-def run_media(name, args, timeout=300):
+def run_media(name, args, timeout=300, progress=None, duration=None):
     executable = shutil.which(name)
     if not executable:
         raise ToolError(f"没有找到 {name}。请安装 FFmpeg 并加入 PATH，或直接使用外挂 SRT/ASS。")
+    if name == "ffmpeg" and progress is not None:
+        return run_ffmpeg_progress(executable, args, timeout, progress, duration)
     try:
         result = subprocess.run([executable, "-v", "error", "-nostdin"] + args if name == "ffmpeg" else [executable, "-v", "error"] + args,
                                 capture_output=True, timeout=timeout,
@@ -256,6 +282,63 @@ def run_media(name, args, timeout=300):
     return result.stdout
 
 
+def run_ffmpeg_progress(executable, args, timeout, progress, duration):
+    total = float(duration) if duration and float(duration) > 0 else None
+    message = "提取原台词字幕"
+    report(progress, message, 0, total, "秒")
+    command = [executable, "-v", "error", "-nostdin", "-nostats", "-stats_period", "0.25",
+               "-progress", "pipe:2"] + args
+    chunks, errors, reader_errors = [], [], []
+    position = 0.0
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as process:
+        def read_stdout():
+            try:
+                while chunk := process.stdout.read(65536):
+                    chunks.append(chunk)
+            except Exception as exc:
+                reader_errors.append(exc)
+
+        def read_stderr():
+            nonlocal position
+            try:
+                for raw in process.stderr:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    key, sep, value = line.partition("=")
+                    if key == "out_time_us" and sep:
+                        try:
+                            at = float(value) / 1_000_000
+                        except ValueError:
+                            continue
+                        if math.isfinite(at):
+                            position = max(position, at)
+                            report(progress, message, position, total, "秒")
+                    elif not (sep and re.fullmatch(r"frame|fps|stream_\d+_\d+_q|bitrate|total_size|out_time.*|dup_frames|drop_frames|speed|progress", key)):
+                        errors.append(line)
+            except Exception as exc:
+                reader_errors.append(exc)
+
+        readers = [threading.Thread(target=read_stdout), threading.Thread(target=read_stderr)]
+        for reader in readers:
+            reader.start()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise ToolError("读取影片超时；异地影片建议先取出文字字幕，再导入本工具。") from exc
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            for reader in readers:
+                reader.join()
+        if process.returncode:
+            raise ToolError("ffmpeg 失败：" + "\n".join(errors)[-1500:])
+        if reader_errors:
+            raise ToolError("读取 FFmpeg 输出失败：" + str(reader_errors[0]))
+    report(progress, message, position, total, "秒", complete=True)
+    return b"".join(chunks)
+
+
 def subtitle_tracks(video):
     if not Path(video).is_file():
         raise ToolError("影片路径不存在或当前无法访问。")
@@ -263,7 +346,8 @@ def subtitle_tracks(video):
     return [s for s in data.get("streams", []) if s.get("codec_type") == "subtitle"]
 
 
-def extract_subtitle(video, index):
+def extract_subtitle(video, index, progress=None, duration=None):
+    report(progress, "检查内封字幕轨道")
     tracks = subtitle_tracks(video)
     if index is None:
         text_tracks = [s for s in tracks if s.get("codec_name") in TEXT_CODECS]
@@ -273,7 +357,9 @@ def extract_subtitle(video, index):
     selected = next((s for s in tracks if s["index"] == int(index)), None)
     if not selected or selected.get("codec_name") not in TEXT_CODECS:
         raise ToolError("所选轨道不是支持的文字字幕。PGS/SUP/DVD 图片字幕请先 OCR 或找文字字幕。")
-    raw = run_media("ffmpeg", ["-i", str(video), "-map", f"0:{index}", "-c:s", "ass", "-f", "ass", "pipe:1"])
+    raw = run_media("ffmpeg", ["-i", str(video), "-map", f"0:{index}", "-c:s", "ass", "-f", "ass", "pipe:1"],
+                    progress=progress, duration=duration)
+    report(progress, "解析原台词字幕")
     return parse_ass(raw.decode("utf-8-sig"))
 
 
@@ -329,7 +415,7 @@ def parse_comments(text):
     return comments, skipped
 
 
-def render_comments(comments, resolution, offset=0, density=8, duration=8, font_size=44):
+def render_comments(comments, resolution, offset=0, density=8, duration=8, font_size=44, progress=None):
     width, height = resolution
     offset, duration, font_size = finite(offset, "弹幕偏移"), finite(duration, "滚动时长"), finite(font_size, "字号")
     if not 1 <= int(density) <= 30 or not 2 <= duration <= 20 or not 16 <= font_size <= 100:
@@ -342,7 +428,12 @@ def render_comments(comments, resolution, offset=0, density=8, duration=8, font_
     doc.info.update(PlayResX=str(width), PlayResY=str(height), WrapStyle="2")
     doc.styles["Scroll"].update(Alignment="7", Outline=str(round(max(1, size / 22), 2)), MarginL="0", MarginR="0", MarginV="0")
     seen, omitted = {}, 0
-    for comment in sorted(comments, key=lambda x: x.time):
+    total = len(comments)
+    report(progress, "排列弹幕", 0, total, "条")
+    for index, comment in enumerate(sorted(comments, key=lambda x: x.time)):
+        # 计数指已检查的条目，包含去重/限流丢弃项。
+        if index and index % max(1, total // 100) == 0:
+            report(progress, "排列弹幕", index, total, "条")
         at = comment.time + offset
         message = escape_text(comment.text)[:120]
         if at < 0 or (message in seen and at - seen[message] < 15):
@@ -364,6 +455,7 @@ def render_comments(comments, resolution, offset=0, density=8, duration=8, font_
         doc.events.append(event(round(at * 100), round((at + duration) * 100), tags + message, "Scroll"))
     if not doc.events:
         raise ToolError("偏移/过滤后没有可显示的弹幕，请调整参数。")
+    report(progress, "排列弹幕", total, total, "条", complete=True)
     return doc, omitted
 
 
@@ -425,17 +517,28 @@ def merge_ass(subtitles, danmaku):
     return base
 
 
-def save_new(path, text):
+def save_new(path, text, progress=None):
     path = Path(path)
+    raw = text.encode("utf-8")
+    total = len(raw)
+    report(progress, "写入影片原目录", 0, total, "字节")
     path.parent.mkdir(parents=True, exist_ok=True)
     for version in range(1, 10000):
         candidate = path if version == 1 else path.with_name(f"{path.stem}-v{version}{path.suffix}")
         try:
-            with candidate.open("x", encoding="utf-8", newline="\n") as stream:
-                stream.write(text)
-            return candidate
+            stream = candidate.open("xb")
         except FileExistsError:
             continue
+        with stream:
+            written = 0
+            while written < total:
+                count = stream.write(raw[written:written + 65536])
+                if not count:
+                    raise OSError("字幕文件写入中断。")
+                written += count
+                report(progress, "写入影片原目录", written, total, "字节")
+        report(progress, "写入影片原目录", total, total, "字节", complete=True)
+        return candidate
     raise ToolError("同名版本文件过多，请换一个输出目录。")
 
 
@@ -526,11 +629,12 @@ HELP = """字幕弹幕一键合成 v2（单文件）
 字幕默认保留原样式；XML/JSON 弹幕重排，底部 32% 留给台词，最多 8 条同时滚动。
 字幕与弹幕同属一条 ASS，播放时选择这条字幕即可。想仅看台词，选回原字幕轨。
 
-双击 .py 或运行 python 字幕弹幕一键合成_v2.py；也可把影片路径作为第一个参数传入。
+进度条表示当前步骤；切换步骤时会归零。没有可用总量时只显示等待/接收量和耗时。
+双击 .py 或运行 python nas_danmaku.py；也可把影片路径作为第一个参数传入。
 """
 
 
-def web_bytes(url, data=None, timeout=25):
+def web_bytes(url, data=None, timeout=25, progress=None, message="下载数据"):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username or parsed.password:
         raise ToolError("服务返回了无效的下载链接。")
@@ -538,21 +642,38 @@ def web_bytes(url, data=None, timeout=25):
     if data is not None:
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     req = urllib.request.Request(url, data=data, headers=headers)
+    report(progress, message)
     try:
         with urllib.request.build_opener(SafeRedirect()).open(req, timeout=timeout) as response:
-            raw = response.read(MAX_BYTES + 1)
+            length = response.headers.get("Content-Length", "")
+            total = int(length) if length.isdigit() and not response.headers.get("Transfer-Encoding") else None
+            if total is not None and total > MAX_BYTES:
+                raise ToolError("服务返回超过 32 MB，已停止。")
+            chunks, received = [], 0
+            report(progress, message, received, total, "字节")
+            read = getattr(response, "read1", response.read)
+            while chunk := read(min(65536, MAX_BYTES + 1 - received)):
+                chunks.append(chunk)
+                received += len(chunk)
+                if received > MAX_BYTES:
+                    raise ToolError("服务返回超过 32 MB，已停止。")
+                report(progress, message, received, total, "字节")
+            if total is not None and received != total:
+                raise ToolError("下载未完成：实际接收量与服务返回的文件大小不一致，请重试。")
+            raw = b"".join(chunks)
     except urllib.error.HTTPError as exc:
         raise ToolError(f"{parsed.hostname} 返回 HTTP {exc.code}，服务暂不可用。") from None
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
         raise ToolError(f"连接 {parsed.hostname} 失败或超时。") from None
-    if len(raw) > MAX_BYTES:
-        raise ToolError("服务返回超过 32 MB，已停止。")
+    report(progress, message, received, total, "字节", complete=True)
     return raw
 
 
-def web_json(url, data=None):
+def web_json(url, data=None, progress=None, message="下载数据"):
     try:
-        return json.loads(web_bytes(url, data).decode("utf-8-sig"))
+        raw = web_bytes(url, data, progress=progress, message=message)
+        report(progress, "解析下载的数据")
+        return json.loads(raw.decode("utf-8-sig"))
     except (UnicodeError, ValueError):
         raise ToolError("在线服务返回内容不是有效 JSON。") from None
 
@@ -835,15 +956,18 @@ def fetch_public_danmaku(movie, progress, platform=None):
         if key not in movie["links"]:
             continue
         url = canonical_platform_url(movie["links"][key])
-        progress("正在获取“" + movie["title"] + "”的" + PLATFORMS[key] + "弹幕…")
         try:
-            data = web_json(PUBLIC_DANMAKU + "?" + urllib.parse.urlencode({"ac": "dm", "url": url}))
+            data = web_json(PUBLIC_DANMAKU + "?" + urllib.parse.urlencode({"ac": "dm", "url": url}),
+                            progress=progress, message=f"下载{PLATFORMS[key]}弹幕（主源）")
+            report(progress, "解析弹幕")
             comments = parse_public_comments(data)
             return comments, PLATFORMS[key] + " · 公益弹幕库", url
         except ToolError as exc:
             errors.append(str(exc))
         try:
-            raw = web_bytes(PUBLIC_DANMAKU_BACKUP + "?" + urllib.parse.urlencode({"type": "xml", "id": url}))
+            raw = web_bytes(PUBLIC_DANMAKU_BACKUP + "?" + urllib.parse.urlencode({"type": "xml", "id": url}),
+                            progress=progress, message=f"下载{PLATFORMS[key]}弹幕（备用源）")
+            report(progress, "解析弹幕")
             comments, _ = parse_comments(raw.decode("utf-8-sig"))
             return comments, PLATFORMS[key] + " · 公共弹幕库备用", url
         except (ToolError, UnicodeError) as exc:
@@ -878,18 +1002,21 @@ def scan_movie(video, override="", progress=lambda _: None):
     identity = identify_movie(video, override)
     result = ScanResult(video, identity, meta, file_signature(video))
     progress(f"识别片名：{identity['title']} {identity['year']}；正在查找字幕和电影弹幕…")
+    report(progress, "查找字幕和电影来源", 0, 2, "项")
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        sub_future = pool.submit(discover_subtitles, video, meta, progress)
+        sub_future = pool.submit(discover_subtitles, video, meta, lambda _: None)
         movie_future = pool.submit(search_movies, identity["title"], identity["year"])
-        try:
-            result.subtitles, warnings = sub_future.result()
-            result.warnings.extend(warnings)
-        except (ToolError, OSError) as exc:
-            result.warnings.append("字幕识别失败：" + str(exc))
-        try:
-            result.movies = movie_future.result()
-        except ToolError as exc:
-            result.warnings.append("电影弹幕搜索失败：" + str(exc))
+        for count, future in enumerate(concurrent.futures.as_completed([sub_future, movie_future]), 1):
+            try:
+                if future is sub_future:
+                    result.subtitles, warnings = future.result()
+                    result.warnings.extend(warnings)
+                else:
+                    result.movies = future.result()
+            except (ToolError, OSError) as exc:
+                label = "字幕识别失败：" if future is sub_future else "电影弹幕搜索失败："
+                result.warnings.append(label + str(exc))
+            report(progress, "查找字幕和电影来源", count, 2, "项", complete=count == 2)
     if result.movies:
         chosen = result.movies[0]
         if identity["year"] and chosen["year"] and identity["year"] != chosen["year"]:
@@ -911,11 +1038,11 @@ def scan_movie(video, override="", progress=lambda _: None):
     return result
 
 
-def materialize_subtitle(choice, video):
+def materialize_subtitle(choice, video, progress=None, duration=None):
     if choice.kind == "file":
         doc = load_subtitle(choice.path)
     elif choice.kind == "embedded":
-        doc = extract_subtitle(video, choice.index)
+        doc = extract_subtitle(video, choice.index, progress=progress, duration=duration)
     elif choice.doc is not None:
         doc = copy.deepcopy(choice.doc)
     else:
@@ -932,28 +1059,58 @@ def synthesize(result, subtitle_index=0, offset=0, density=8, duration=8, font_s
     if not result.comments and result.dm_ass is None:
         raise ToolError("还没有取得弹幕，暂时无法合成。")
     progress("正在读取/提取所选原台词字幕…")
-    base = materialize_subtitle(result.subtitles[subtitle_index], result.video)
+    length = finite(result.metadata.get("format", {}).get("duration", 0) or 0, "影片时长")
+    base = materialize_subtitle(result.subtitles[subtitle_index], result.video, progress=progress, duration=length)
     progress("正在排列弹幕并合并台词…")
     if result.dm_ass is not None:
         dm = copy.deepcopy(result.dm_ass)
         shift_events(dm, offset, is_danmaku=True)
         filtered = 0
     else:
-        length = finite(result.metadata.get("format", {}).get("duration", 0) or 0, "影片时长")
         shift = finite(offset, "弹幕偏移")
         comments = [c for c in result.comments if not length or c.time + shift < length]
-        dm, filtered = render_comments(comments, base.resolution, offset, density, duration, font_size)
+        dm, filtered = render_comments(comments, base.resolution, offset, density, duration, font_size, progress=progress)
         filtered += len(result.comments) - len(comments)
+    progress("合并台词和弹幕")
     final = merge_ass(base, dm)
     target = result.video.with_name(result.video.stem + "-字幕加弹幕.ass")
     progress("正在写入影片原目录…")
     try:
-        output = save_new(target, final.dumps())
+        output = save_new(target, final.dumps(), progress=progress)
     except OSError as exc:
         raise ToolError("无法写入影片原目录，请检查 NAS 是否在线、此目录是否有新建文件权限。原文件未覆盖。") from exc
     return {"output": str(output), "subtitle_lines": len(base.events), "danmaku_lines": len(dm.events), "filtered": filtered}
 
 # ---- 一个窗口：选择、展示、确认合成 ----
+
+def elapsed_text(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
+
+
+def progress_detail(update, elapsed):
+    def amount(value):
+        if update.unit == "字节":
+            return f"{value / 1048576:.2f} MB" if value >= 1048576 else f"{value / 1024:.1f} KB"
+        if update.unit == "秒":
+            return elapsed_text(value)
+        return f"{value:,.0f} {update.unit}"
+
+    percent = update.percent
+    if update.complete:
+        detail = "本步完成 · 100%"
+    elif percent is not None:
+        detail = f"{percent:.1f}% · {amount(update.current)} / {amount(update.total)}"
+        if update.current >= update.total:
+            detail += " · 等待收尾确认"
+    elif update.current is not None:
+        detail = f"已{'提取字幕至' if update.unit == '秒' else '接收'} {amount(update.current)} · 总量未知"
+    else:
+        detail = "等待结果，暂无法计算百分比"
+    if update.unit == "秒" and not update.complete and update.total:
+        detail += "（字幕时间 / 片长）"
+    return detail + " · 本步已用 " + elapsed_text(elapsed)
+
 
 class App:
     def __init__(self, root, initial=""):
@@ -964,6 +1121,8 @@ class App:
         self.result = None
         self.busy = False
         self.tasks = queue.Queue()
+        self.active_progress = None
+        self.task_started = self.step_started = 0.0
         self.path = tk.StringVar(value=initial)
         self.title = tk.StringVar()
         self.identity_text = tk.StringVar(value="选择影片后自动识别")
@@ -971,6 +1130,7 @@ class App:
         self.movie = tk.StringVar()
         self.dm_text = tk.StringVar(value="等待选择影片")
         self.status = tk.StringVar(value="选影片 → 自动查找 → 核对字幕与弹幕 → 确认合成")
+        self.progress_text = tk.StringVar(value="进度按当前步骤计算；切换步骤时归零")
         self.offset = tk.StringVar(value="0")
         self.density = tk.StringVar(value="8")
         self.output_text = tk.StringVar(value="输出到：所选影片的原目录")
@@ -984,7 +1144,7 @@ class App:
         head.pack(fill="x")
         ttk.Label(head, text="字幕＋弹幕", style="Title.TLabel").pack(side="left")
         ttk.Button(head, text="使用说明", command=self.help).pack(side="right")
-        ttk.Label(p, text="选择一部电影，找到台词和弹幕，合成一条字幕放回原目录。", foreground="#606975").pack(anchor="w", pady=(4, 14))
+        ttk.Label(p, text="选择一部电影，找到台词和弹幕，合成一条字幕放回原目录。", foreground="#606975").pack(anchor="w", pady=(4, 10))
         row = ttk.Frame(p)
         row.pack(fill="x")
         self.path_entry = ttk.Entry(row, textvariable=self.path)
@@ -1029,12 +1189,13 @@ class App:
         ttk.Label(p, textvariable=self.output_text, wraplength=790).pack(anchor="w", pady=(0, 8))
         self.generate_button = ttk.Button(p, text="确认合成 → 保存到影片原目录", command=self.generate, state="disabled")
         self.generate_button.pack(fill="x")
-        self.progress_bar = ttk.Progressbar(p, mode="indeterminate")
-        self.progress_bar.pack(fill="x", pady=(10, 6))
+        self.progress_bar = ttk.Progressbar(p, mode="determinate", maximum=100)
+        self.progress_bar.pack(fill="x", pady=(6, 6))
         ttk.Label(p, textvariable=self.status, wraplength=790).pack(anchor="w")
+        ttk.Label(p, textvariable=self.progress_text, foreground="#606975", wraplength=790).pack(anchor="w")
         log_frame = ttk.Frame(p)
         log_frame.pack(fill="both", expand=True, pady=(6, 0))
-        self.log_box = tk.Text(log_frame, height=5, wrap="word", state="disabled", font=("Microsoft YaHei UI", 9))
+        self.log_box = tk.Text(log_frame, height=4, wrap="word", state="disabled", font=("Microsoft YaHei UI", 9))
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_box.yview)
         self.log_box.configure(yscrollcommand=scrollbar.set)
         self.log_box.pack(side="left", fill="both", expand=True)
@@ -1072,9 +1233,9 @@ class App:
         self.sub_box.configure(state="disabled" if busy else "readonly")
         self.movie_box.configure(state="disabled" if busy else "readonly")
         if busy:
-            self.progress_bar.start(12)
-        else:
-            self.progress_bar.stop()
+            self.task_started = time.monotonic()
+            self.active_progress = None
+            self.apply_progress(ProgressUpdate("准备处理"))
         self.update_ready()
 
     def update_ready(self):
@@ -1095,28 +1256,47 @@ class App:
     def progress(self, message):
         self.tasks.put(("progress", message, None))
 
+    def apply_progress(self, update):
+        if isinstance(update, str):
+            update = ProgressUpdate(update)
+        if self.active_progress is None or update.message != self.active_progress.message:
+            self.step_started = time.monotonic()
+            self.log(update.message)
+        self.active_progress = update
+        self.status.set("当前步骤：" + update.message)
+        self.progress_bar["value"] = update.percent if update.percent is not None else 0
+        self.refresh_progress_time()
+
+    def refresh_progress_time(self):
+        if self.busy and self.active_progress is not None:
+            self.progress_text.set(progress_detail(self.active_progress, time.monotonic() - self.step_started))
+
     def poll(self):
         try:
             while True:
                 kind, first, second = self.tasks.get_nowait()
                 if kind == "progress":
-                    self.status.set(first)
-                    self.log(first)
+                    self.apply_progress(first)
                 elif kind == "error":
                     if self.result is None:
                         self.subtitle.set("识别未完成，请检查路径后重试")
                         self.movie.set("识别未完成")
                         self.dm_text.set("尚未获取弹幕")
                     self.set_busy(False)
+                    self.progress_bar["value"] = 0
+                    self.progress_text.set("已停止 · 用时 " + elapsed_text(time.monotonic() - self.task_started))
                     self.status.set("未完成：" + first)
                     self.log(first)
                     messagebox.showerror("未完成", first)
                 else:
                     self.set_busy(False)
+                    self.progress_bar["value"] = 100
+                    self.progress_text.set("本次处理结束 · 用时 " + elapsed_text(time.monotonic() - self.task_started))
                     first(second)
                     self.update_ready()
         except queue.Empty:
             pass
+        self.refresh_progress_time()
         self.root.after(100, self.poll)
 
     def scan(self, override=False):

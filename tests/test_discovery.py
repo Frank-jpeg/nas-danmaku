@@ -122,6 +122,15 @@ class AutoTests(unittest.TestCase):
         with self.assertRaises(d.ToolError):
             d.canonical_platform_url('https://qq.com.evil.test/x')
 
+    def test_bilingual_title_retries_chinese_name(self):
+        from urllib.parse import parse_qs, urlsplit
+        empty = {'data': {'longData': None}}
+        with patch.object(d, 'web_json', side_effect=[empty, copy.deepcopy(SEARCH_REPLY)]) as web:
+            rows = d.search_movies('流浪地球 The Wandering Earth', '2019')
+        queries = [parse_qs(urlsplit(call.args[0]).query)['kw'][0] for call in web.call_args_list]
+        self.assertEqual(queries, ['流浪地球 The Wandering Earth', '流浪地球'])
+        self.assertEqual(rows[0]['title'], '流浪地球')
+
     def test_full_scan_then_confirm_original_dir(self):
         data = copy.deepcopy(SEARCH_REPLY)
         comments = [d.Comment(4, '测试弹幕')]

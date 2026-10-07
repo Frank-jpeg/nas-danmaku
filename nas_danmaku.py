@@ -23,7 +23,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
@@ -32,6 +32,18 @@ TEXT_CODECS = {"ass", "ssa", "subrip", "srt", "mov_text", "text", "webvtt"}
 
 class ToolError(Exception):
     pass
+
+
+def normalize_path(value):
+    path = Path(value).expanduser()
+    try:
+        return path.resolve()
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1005:
+            raise
+        # 某些虚拟映射盘支持读写，却不支持 Windows 的最终路径查询。
+        # 保留用户选择的盘符路径；后续仍检查文件可读性及大小/修改时间。
+        return Path(os.path.abspath(path))
 
 
 def finite(value, label="数值"):
@@ -457,7 +469,7 @@ def build(subtitle=None, video=None, track=None, danmaku=None, out_dir=None, nam
         extra, filtered = render_comments(comments, base.resolution, offset, density, duration, font_size)
     merged = merge_ass(base, extra)
     path = save_new(Path(out_dir) / f"{name}-字幕加弹幕.ass", merged.dumps())
-    return {"output": str(path.resolve()), "subtitle_lines": len(base.events), "danmaku_read": count,
+    return {"output": str(normalize_path(path)), "subtitle_lines": len(base.events), "danmaku_read": count,
             "danmaku_written": len(extra.events), "invalid_or_special": skipped,
             "filtered_or_over_limit": filtered, "warnings": warnings}
 
@@ -738,6 +750,10 @@ def discover_subtitles(video, meta, progress):
 
 def search_movies(title, year=""):
     queries = [title]
+    # 发布文件常同时包含中英文片名，完整组合无结果时再查中文标题。
+    bilingual = re.match(r"^([\u4e00-\u9fff][^A-Za-z]*?)\s+[A-Za-z]", title)
+    if bilingual:
+        queries.append(bilingual.group(1).strip(" ._-"))
     # 英文片名先找中文别名，有助于匹配国内平台；失败继续原片名。
     if not re.search(r"[\u4e00-\u9fff]", title):
         try:
@@ -856,7 +872,7 @@ def file_signature(video):
 
 
 def scan_movie(video, override="", progress=lambda _: None):
-    video = Path(video).expanduser().resolve()
+    video = normalize_path(video)
     progress("正在读取影片信息…")
     meta = inspect_video(video)
     identity = identify_movie(video, override)
@@ -942,7 +958,7 @@ def synthesize(result, subtitle_index=0, offset=0, density=8, duration=8, font_s
 class App:
     def __init__(self, root, initial=""):
         self.root = root
-        root.title("字幕＋弹幕 · 一键合成 v2")
+        root.title("字幕＋弹幕 · 一键合成 v" + VERSION)
         root.geometry("860x650")
         root.minsize(780, 620)
         self.result = None
@@ -1087,6 +1103,10 @@ class App:
                     self.status.set(first)
                     self.log(first)
                 elif kind == "error":
+                    if self.result is None:
+                        self.subtitle.set("识别未完成，请检查路径后重试")
+                        self.movie.set("识别未完成")
+                        self.dm_text.set("尚未获取弹幕")
                     self.set_busy(False)
                     self.status.set("未完成：" + first)
                     self.log(first)
@@ -1197,7 +1217,7 @@ class App:
         if self.busy or r is None:
             return
         try:
-            current = Path(self.path.get().strip().strip('"')).expanduser().resolve()
+            current = normalize_path(self.path.get().strip().strip('"'))
             if current != r.video:
                 raise ToolError("路径已经改变，请点击“识别”重新读取后再合成。")
             index = self.sub_box.current()

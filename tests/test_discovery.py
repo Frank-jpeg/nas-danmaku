@@ -184,7 +184,7 @@ class AutoTests(unittest.TestCase):
         self.addCleanup(lambda: (root.destroy(), gc.collect()))
         root.withdraw()
         app = d.App(root); root.update_idletasks()
-        self.assertLessEqual(root.winfo_reqheight(), 690)
+        self.assertLessEqual(root.winfo_reqheight(), 770)
         result = d.ScanResult(self.video, {'title':'流浪地球','year':'2019','source':'文件名'}, self.meta,
                               d.file_signature(self.video), subtitles=d.embedded_choices(self.meta), comments=[d.Comment(3,'滚动测试')], danmaku_source='测试')
         app.path.set(str(self.video))

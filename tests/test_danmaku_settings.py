@@ -142,6 +142,10 @@ class SettingsGuiTests(unittest.TestCase):
         self.app.sub_box.current(0)
         self.app.movie_box.configure(values=['电影'])
         self.app.movie_box.current(0)
+        self.app.result.source_catalog[d.movie_source_key(MOVIE)] = [
+            d.DanmakuSource('qq', [d.Comment(0, '腾讯弹幕')], '腾讯视频', MOVIE['links']['qq']),
+            d.DanmakuSource('qiyi', error='查询超时')]
+        d.select_danmaku_source(self.app.result, MOVIE, 'qq')
         self.app.refresh_platforms()
         self.app.update_ready()
 
@@ -157,33 +161,32 @@ class SettingsGuiTests(unittest.TestCase):
             time.sleep(.01)
         self.assertFalse(self.app.busy)
 
-    def test_only_available_platforms_and_failure_clears_old_comments(self):
+    def test_only_fetched_sources_can_be_selected_and_switch_uses_cache(self):
         app = self.app
-        self.assertEqual(tuple(app.platform_box['values']), ('自动', '腾讯视频', '爱奇艺'))
-        app.platform_box.current(2)
-        with patch.object(d, 'fetch_public_danmaku', side_effect=d.ToolError('切换失败')) as fetch, \
-                patch.object(d.messagebox, 'showerror'):
-            app.change_platform()
+        self.assertEqual(tuple(app.platform_box['values']), ('腾讯视频 · 1 条',))
+        self.assertIn('爱奇艺 · 未取得', app.source_status.get())
+        new_comments = [d.Comment(1, '爱奇艺弹幕')]
+        with patch.object(d, 'fetch_public_danmaku', return_value=(new_comments, '爱奇艺', MOVIE['links']['qiyi'])) as fetch:
+            app.retry_sources()
             self.assertEqual(str(app.platform_box['state']), 'disabled')
             self.wait()
         self.assertEqual(fetch.call_args.kwargs['platform'], 'qiyi')
-        self.assertEqual(app.result.comments, [])
-        self.assertEqual(str(app.generate_button['state']), 'disabled')
-        self.assertIn('切换失败', app.status.get())
-        new_comments = [d.Comment(1, '爱奇艺弹幕')]
-        with patch.object(d, 'fetch_public_danmaku', return_value=(new_comments, '爱奇艺', 'url')):
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(app.result.selected_platform, 'qq')
+        self.assertEqual(tuple(app.platform_box['values']), ('腾讯视频 · 1 条', '爱奇艺 · 1 条'))
+        app.platform_box.current(1)
+        with patch.object(d, 'fetch_public_danmaku', side_effect=AssertionError('切换不能重新下载')):
             app.change_platform()
-            self.wait()
+        self.assertFalse(app.busy)
         self.assertEqual(app.result.comments, new_comments)
         self.assertTrue(list(Path(self.tmp.name).glob('danmaku*.json')))
         self.assertEqual(str(app.generate_button['state']), 'normal')
 
-    def test_changed_movie_resets_unavailable_platform(self):
-        self.app.platform_box.current(2)
+    def test_changed_movie_does_not_reuse_another_candidates_sources(self):
         self.app.result.movies = [dict(MOVIE, links={'qq': MOVIE['links']['qq']})]
         self.app.refresh_platforms()
-        self.assertEqual(self.app.platform.get(), '自动')
-        self.assertEqual(self.app.platform_keys, [None, 'qq'])
+        self.assertEqual(self.app.platform.get(), '来源待查询')
+        self.assertEqual(self.app.platform_keys, [])
 
     def test_dialog_applies_to_actual_synthesis_and_cancel_keeps_settings(self):
         app = self.app

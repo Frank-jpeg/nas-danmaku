@@ -31,7 +31,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
@@ -954,7 +954,9 @@ NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS
 缓存和成品保存在 %LOCALAPPDATA%/NasDanmaku/cache，界面日志会显示具体目录。
 
 弹幕：按片名通过 360 影视查找电影平台链接，再向公开弹幕库按需请求；不需要你填密钥。
-“来源”可选自动或当前电影找到的平台。指定平台失败会提示，可自行换源；不会悄悄换成其他平台。
+选中电影后，自动核实其已找到链接的各个平台，显示来源和实际取得的原始弹幕条数。
+“来源”只列出已取得并缓存的弹幕，切换直接用本机缓存。未取得的来源单独标注，详细原因见日志。
+“重查来源”仅重试未取得的项目，保留已成功来源，不重新读取 NAS 或下载台词。其他电影候选选中后再查。
 公开服务： https://dmku.hls.one/ ；备用 https://danmu.zxz.ee/ 。
 在线字幕：迅雷、SubHD 按片名查询；射手按视频指纹查询；SubtitleCat 作为可能机翻的末位备用。
 这些外部服务可能变更/限流、没有某部电影的数据。失败会显示原因，支持修改片名重新识别或手动补选文件。
@@ -1679,6 +1681,98 @@ def fetch_public_danmaku(movie, progress, platform=None):
 
 
 @dataclass
+class DanmakuSource:
+    platform: str
+    comments: list = field(default_factory=list)
+    source: str = ""
+    url: str = ""
+    cache_path: str = ""
+    error: str = ""
+
+    @property
+    def available(self):
+        return bool(self.comments) and not self.error
+
+    @property
+    def label(self):
+        return f"{PLATFORMS[self.platform]} · {len(self.comments):,} 条" if self.available else f"{PLATFORMS[self.platform]} · 未取得"
+
+
+def movie_source_key(movie):
+    # 标题/年份及实际链接一起隔离缓存，避免切换版本时串用弹幕。
+    return (movie.get("title", ""), movie.get("year", ""),
+            tuple((key, movie["links"][key]) for key in PLATFORMS if key in movie["links"]))
+
+
+def source_summary(options):
+    if options is None:
+        return "来源尚未查询，选中电影后自动核实。"
+    return "；".join(option.label for option in options) or "没有受支持的平台链接。"
+
+
+def movie_choice_label(movie, catalog):
+    options = catalog.get(movie_source_key(movie))
+    available = [option.label for option in options or [] if option.available]
+    found = " / ".join(available) if available else ("未取得弹幕" if options is not None else "来源待查询")
+    return f"{movie['title']} · {movie.get('year', '')} · {movie.get('duration') or '时长未知'} · {found}"
+
+
+def cached_comment_file(comments, folder, name="danmaku.json", progress=None):
+    text = json.dumps([{"time": c.time, "text": c.text, "color": c.color, "mode": c.mode}
+                       for c in comments], ensure_ascii=False)
+    return save_new(Path(folder) / name, text, progress, "缓存弹幕到本机")
+
+
+def discover_danmaku_sources(result, movie, progress=None, retry_failed=False):
+    key = movie_source_key(movie)
+    previous = result.source_catalog.get(key)
+    if previous is not None and not retry_failed:
+        return previous
+    retained = {option.platform: option for option in previous or [] if option.available}
+    keys = [platform for platform in PLATFORMS if platform in movie["links"]]
+    pending = [platform for platform in keys if platform not in retained]
+    if result.workspace is None:
+        result.workspace = local_workspace()
+    def fetch(platform):
+        try:
+            comments, source, url = fetch_public_danmaku(movie, lambda _: None, platform=platform)
+            if not comments:
+                raise ToolError("该来源未返回可用弹幕。")
+            path = cached_comment_file(comments, result.workspace, f"danmaku-{platform}.json")
+            return DanmakuSource(platform, comments, source, url, str(path))
+        except (ToolError, OSError, ValueError) as exc:
+            return DanmakuSource(platform, error=str(exc))
+    # 同时最多查询三个平台；查询已结束（成功须已缓存）即计数，不混合多路下载字节。
+    if pending:
+        report(progress, "核实各平台弹幕并缓存", 0, len(pending), "个来源")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(pending))) as pool:
+            futures = {pool.submit(fetch, platform): platform for platform in pending}
+            for count, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                retained[futures[future]] = future.result()
+                report(progress, "核实各平台弹幕并缓存", count, len(pending), "个来源", complete=count == len(pending))
+    options = [retained[platform] for platform in keys]
+    result.source_catalog[key] = options
+    return options
+
+
+def select_danmaku_source(result, movie, platform=None):
+    options = result.source_catalog.get(movie_source_key(movie), [])
+    option = next((row for row in options if row.available and (platform is None or row.platform == platform)), None)
+    if option is None:
+        raise ToolError("这个来源尚未取得可用弹幕，请选择标有条数的来源，或点“重查来源”。")
+    result.comments, result.dm_ass = option.comments, None
+    result.danmaku_source, result.danmaku_url = option.source, option.url
+    result.selected_movie_key, result.selected_platform = movie_source_key(movie), option.platform
+    return option
+
+
+def clear_selected_danmaku(result):
+    result.comments, result.dm_ass = [], None
+    result.danmaku_source, result.danmaku_url = "", ""
+    result.selected_movie_key, result.selected_platform = None, ""
+
+
+@dataclass
 class ScanResult:
     video: Path
     identity: dict
@@ -1692,6 +1786,9 @@ class ScanResult:
     warnings: list = field(default_factory=list)
     dm_ass: Ass | None = None
     workspace: Path | None = None
+    source_catalog: dict = field(default_factory=dict)
+    selected_movie_key: tuple | None = None
+    selected_platform: str = ""
 
 
 def file_signature(video):
@@ -1744,13 +1841,12 @@ def scan_movie(video, override="", progress=lambda _: None):
                 result.warnings.append(f"片长差异较大：当前文件约 {length / 60:.1f} 分钟，平台标记 {chosen['duration']}，请确认是否同一版本。")
         except (ValueError, ToolError):
             pass
-        try:
-            result.comments, result.danmaku_source, result.danmaku_url = fetch_public_danmaku(chosen, progress)
-        except ToolError as exc:
-            result.warnings.append(str(exc))
+        options = discover_danmaku_sources(result, chosen, progress)
+        result.warnings.extend(f"{PLATFORMS[option.platform]}未取得弹幕：{option.error}" for option in options if not option.available)
+        if any(option.available for option in options):
+            select_danmaku_source(result, chosen)
     else:
         result.warnings.append("没有找到匹配的电影弹幕来源。可修正片名后重新识别，或补选弹幕文件。")
-    cache_danmaku(result, progress)
     return result
 
 
@@ -1760,9 +1856,7 @@ def cache_danmaku(result, progress=None):
     if result.dm_ass is not None:
         save_new(result.workspace / "danmaku.ass", result.dm_ass.dumps(), progress, "缓存弹幕到本机")
     elif result.comments:
-        text = json.dumps([{"time": c.time, "text": c.text, "color": c.color, "mode": c.mode}
-                           for c in result.comments], ensure_ascii=False)
-        save_new(result.workspace / "danmaku.json", text, progress, "缓存弹幕到本机")
+        cached_comment_file(result.comments, result.workspace, progress=progress)
 
 
 def materialize_subtitle(choice, video, progress=None, duration=None):
@@ -2259,8 +2353,8 @@ class App:
     def __init__(self, root, initial=""):
         self.root = root
         root.title("字幕＋弹幕 · 一键合成 v" + VERSION)
-        root.geometry("900x700")
-        root.minsize(860, 680)
+        root.geometry("900x780")
+        root.minsize(860, 760)
         self.result = None
         self.pending_output = None
         self.busy = False
@@ -2284,8 +2378,9 @@ class App:
         except (ToolError, OSError) as exc:
             self.render_settings["filter_rules"] = default_filter_rules()
             rule_warning = f"读取已保存的屏蔽规则失败，暂用默认规则；原文件未改动。{exc}"
-        self.platform = tk.StringVar(value="自动")
-        self.platform_keys = [None]
+        self.platform = tk.StringVar(value="来源待查询")
+        self.platform_keys = []
+        self.source_status = tk.StringVar(value="选中电影后自动查询各平台，只列出已取得弹幕的可选来源。")
         self.settings_dialog = None
         self.settings_summary = tk.StringVar(value=self.settings_description())
         self.output_text = tk.StringVar(value="输出到：所选影片的原目录")
@@ -2333,12 +2428,17 @@ class App:
         self.movie_box = ttk.Combobox(row, state="readonly", textvariable=self.movie)
         self.movie_box.pack(side="left", fill="x", expand=True)
         self.movie_box.bind("<<ComboboxSelected>>", self.change_movie)
-        ttk.Label(row, text="来源").pack(side="left", padx=(8, 4))
-        self.platform_box = ttk.Combobox(row, state="disabled", textvariable=self.platform, values=["自动"], width=10)
-        self.platform_box.pack(side="left")
-        self.platform_box.bind("<<ComboboxSelected>>", self.change_platform)
         self.manual_dm = ttk.Button(row, text="补选弹幕…", command=self.pick_danmaku)
         self.manual_dm.pack(side="left", padx=(8, 0))
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(6, 0))
+        ttk.Label(row, text="来源").pack(side="left", padx=(8, 4))
+        self.platform_box = ttk.Combobox(row, state="disabled", textvariable=self.platform, width=28)
+        self.platform_box.pack(side="left", fill="x", expand=True)
+        self.platform_box.bind("<<ComboboxSelected>>", self.change_platform)
+        self.retry_sources_button = ttk.Button(row, text="重查来源", command=self.retry_sources)
+        self.retry_sources_button.pack(side="left", padx=(8, 0))
+        ttk.Label(box, textvariable=self.source_status, wraplength=760, foreground="#606975").pack(anchor="w", pady=(6, 0))
         ttk.Label(box, textvariable=self.dm_text, wraplength=760, foreground="#31566e").pack(anchor="w", pady=(8, 0))
         row = ttk.Frame(p)
         row.pack(fill="x", pady=10)
@@ -2444,7 +2544,8 @@ class App:
         self.generate_button.configure(state="normal" if ready else "disabled")
         self.retry_copy_button.configure(state="normal" if not self.busy and self.pending_output else "disabled")
         has_platforms = self.result is not None and bool(self.result.movies) and self.movie_box.current() >= 0
-        self.platform_box.configure(state="readonly" if not self.busy and has_platforms else "disabled")
+        self.platform_box.configure(state="readonly" if not self.busy and has_platforms and self.platform_keys else "disabled")
+        self.retry_sources_button.configure(state="normal" if not self.busy and has_platforms else "disabled")
         self.settings_button.configure(state="disabled" if self.busy or (self.result and self.result.dm_ass) else "normal")
 
     def background(self, work, done):
@@ -2487,6 +2588,7 @@ class App:
                         self.subtitle.set("识别未完成，请检查路径后重试")
                         self.movie.set("识别未完成")
                         self.dm_text.set("尚未获取弹幕")
+                        self.source_status.set("来源查询未完成，请查看下方错误原因。")
                     self.set_busy(False)
                     self.progress_bar["value"] = 0
                     self.progress_text.set("已停止 · 用时 " + elapsed_text(time.monotonic() - self.task_started))
@@ -2515,9 +2617,10 @@ class App:
         self.pending_output = None
         self.sub_box.configure(values=[])
         self.movie_box.configure(values=[])
-        self.platform_keys = [None]
-        self.platform_box.configure(values=["自动"])
-        self.platform.set("自动")
+        self.platform_keys = []
+        self.platform_box.configure(values=[])
+        self.platform.set("来源待查询")
+        self.source_status.set("正在核实各平台弹幕，取得后显示来源与条数。")
         self.subtitle.set("正在识别…")
         self.movie.set("正在查找…")
         self.dm_text.set("正在获取…")
@@ -2534,7 +2637,7 @@ class App:
                 self.sub_box.current(0)
             else:
                 self.subtitle.set("未找到可用文字字幕（见下方提示）")
-            self.movie_box.configure(values=[f"{m['title']} · {m['year']} · {m['duration'] or '时长未知'}" for m in result.movies])
+            self.movie_box.configure(values=[movie_choice_label(m, result.source_catalog) for m in result.movies])
             if result.movies:
                 self.movie_box.current(0)
             else:
@@ -2562,39 +2665,74 @@ class App:
             self.settings_summary.set(self.settings_description())
 
     def refresh_platforms(self):
-        selected = self.platform.get()
         index = self.movie_box.current()
-        movie = self.result.movies[index] if self.result and 0 <= index < len(self.result.movies) else None
-        self.platform_keys = [None] + [key for key in PLATFORMS if movie and key in movie["links"]]
-        labels = ["自动"] + [PLATFORMS[key] for key in self.platform_keys[1:]]
+        r = self.result
+        movie = r.movies[index] if r and 0 <= index < len(r.movies) else None
+        options = r.source_catalog.get(movie_source_key(movie)) if movie else None
+        available = [option for option in options or [] if option.available]
+        self.platform_keys = [option.platform for option in available]
+        labels = [option.label for option in available]
         self.platform_box.configure(values=labels)
-        self.platform_box.current(labels.index(selected) if selected in labels else 0)
+        if movie and r.selected_movie_key == movie_source_key(movie) and r.selected_platform in self.platform_keys:
+            self.platform_box.current(self.platform_keys.index(r.selected_platform))
+        elif r and r.danmaku_source.startswith("手动补选"):
+            self.platform.set("手动导入")
+        else:
+            self.platform.set("请选择已取得的来源" if available else "未取得可用来源" if options is not None else "来源待查询")
+        summary = source_summary(options) if movie else "未匹配到电影来源，可修正片名或手动补选弹幕。"
+        self.source_status.set(summary + ("；未取得的原因见下方日志。" if any(not option.available for option in options or []) else ""))
 
     def change_platform(self, _=None):
-        self.change_movie()
+        index, source_index = self.movie_box.current(), self.platform_box.current()
+        if self.busy or not self.result or not 0 <= index < len(self.result.movies) or not 0 <= source_index < len(self.platform_keys):
+            return
+        try:
+            select_danmaku_source(self.result, self.result.movies[index], self.platform_keys[source_index])
+        except ToolError as exc:
+            self.status.set(str(exc))
+            self.refresh_platforms()
+            return
+        self.show_danmaku()
+        self.status.set("已切换到本机缓存的弹幕，无需重新下载；请核对后确认合成。")
+        self.update_ready()
 
-    def change_movie(self, _=None):
+    def change_movie(self, _=None, *, retry_failed=False):
         index = self.movie_box.current()
         if self.busy or not self.result or not 0 <= index < len(self.result.movies):
             return
-        self.refresh_platforms()
-        platform = self.platform_keys[self.platform_box.current()]
         r = self.result
-        r.comments, r.dm_ass = [], None
-        r.danmaku_source, r.danmaku_url = "", ""
+        movie = r.movies[index]
+        key = movie_source_key(movie)
+        previous_platform = r.selected_platform if r.selected_movie_key == key else ""
+        keep_manual = retry_failed and r.danmaku_source.startswith("手动补选") and bool(r.comments or r.dm_ass)
+        if not retry_failed:
+            clear_selected_danmaku(r)
+        self.refresh_platforms()
         self.show_danmaku()
-        def done(value):
-            r.comments, r.danmaku_source, r.danmaku_url = value
+        self.update_ready()
+        def done(options):
+            if any(option.available for option in options) and not keep_manual:
+                preferred = previous_platform if any(option.available and option.platform == previous_platform for option in options) else None
+                select_danmaku_source(r, movie, preferred)
+            elif not retry_failed:
+                clear_selected_danmaku(r)
+            self.movie_box.configure(values=[movie_choice_label(m, r.source_catalog) for m in r.movies])
+            self.movie_box.current(index)
+            self.refresh_platforms()
             self.show_danmaku()
-            self.status.set("已切换弹幕来源，请核对后确认合成。")
-        def work():
-            value = fetch_public_danmaku(r.movies[index], self.progress, platform=platform)
-            cached = copy.copy(r)
-            cached.comments, cached.danmaku_source, cached.danmaku_url = value
-            cache_danmaku(cached, self.progress)
-            r.workspace = cached.workspace
-            return value
-        self.background(work, done)
+            for option in options:
+                if not option.available:
+                    self.log(f"{PLATFORMS[option.platform]}未取得弹幕：{option.error}")
+            self.status.set("已列出弹幕来源与条数，切换直接使用本机缓存。" if any(option.available for option in options)
+                            else "当前候选未取得在线弹幕，可重查来源、换候选或补选文件。")
+            self.update_ready()
+        if key in r.source_catalog and not retry_failed:
+            done(r.source_catalog[key])
+        else:
+            self.background(lambda: discover_danmaku_sources(r, movie, self.progress, retry_failed=retry_failed), done)
+
+    def retry_sources(self):
+        self.change_movie(retry_failed=True)
 
     def use_embedded(self):
         if self.busy or self.result is None:
@@ -2639,6 +2777,8 @@ class App:
                     self.result.comments, _ = parse_comments(read_text(path))
                     self.result.dm_ass = None
                 self.result.danmaku_source = "手动补选 · " + Path(path).name
+                self.result.danmaku_url = ""
+                self.result.selected_movie_key, self.result.selected_platform = None, ""
                 cache_danmaku(self.result)
                 self.platform.set("手动导入")
                 self.show_danmaku()

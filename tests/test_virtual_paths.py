@@ -42,7 +42,8 @@ class VirtualPathTests(unittest.TestCase):
             subtitle = video.with_suffix('.chs.srt')
             subtitle.write_text('1\n00:00:01,000 --> 00:00:04,000\n原台词\n', encoding='utf-8')
             meta = {'format': {'duration': '10'}, 'streams': []}
-            movie = {'title': '电影', 'year': '2020', 'duration': '0:00:10'}
+            movie = {'title': '电影', 'year': '2020', 'duration': '0:00:10',
+                     'links': {'qq': 'https://v.qq.com/x/cover/test.html'}}
             with patch.object(Path, 'resolve', side_effect=unsupported_volume()), \
                  patch.object(d, 'inspect_video', return_value=meta), \
                  patch.object(d, 'search_movies', return_value=[movie]), \

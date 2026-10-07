@@ -207,7 +207,7 @@ class SettingsGuiTests(unittest.TestCase):
         self.assertEqual(doc.styles['DM_0']['Fontsize'], '24.0')
         self.assertEqual(doc.styles['DM_0']['PrimaryColour'], '&HA1FFFFFF')
         dm = next(row for row in doc.events if row['Style'].startswith('DM_'))
-        self.assertEqual(d.stamp(dm['End']) - d.stamp(dm['Start']), 400)
+        self.assertEqual(d.stamp(dm['End']) - d.stamp(dm['Start']), 600)
         app.open_settings()
         app.settings_dialog.window.withdraw()
         app.settings_dialog.reset()

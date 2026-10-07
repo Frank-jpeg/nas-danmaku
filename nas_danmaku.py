@@ -31,12 +31,13 @@ import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
+DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
 TEXT_CODECS = {"ass", "ssa", "subrip", "srt", "mov_text", "text", "webvtt"}
-DM_DEFAULTS = dict(font_size=32, duration=8, area=25, opacity=80, block_scroll=False,
+DM_DEFAULTS = dict(font_size=32, duration=DEFAULT_DANMAKU_DURATION, area=25, opacity=80, block_scroll=False,
                    block_fixed=True, block_color=False, avoid_subtitles=True, deduplicate=True,
                    block_noise=True, block_keywords="", filter_rules=None)
 
@@ -681,15 +682,15 @@ def save_filter_rules(rules, path=None, backup_dir=None):
             temporary.unlink()
 
 
-def render_comments(comments, resolution, offset=0, density=6, duration=8, font_size=32, progress=None,
+def render_comments(comments, resolution, offset=0, density=6, duration=DEFAULT_DANMAKU_DURATION, font_size=32, progress=None,
                     *, area=25, opacity=80, block_scroll=False, block_fixed=True, block_color=False,
                     avoid_subtitles=True, deduplicate=True, block_noise=True, block_keywords="", filter_stats=None,
                     filter_rules=None):
     width, height = resolution
     offset, duration, font_size = finite(offset, "弹幕偏移"), finite(duration, "滚动时长"), finite(font_size, "字号")
     density, area, opacity = finite(density, "同屏条数"), finite(area, "显示区域"), finite(opacity, "不透明度")
-    if not density.is_integer() or not 1 <= density <= 30 or not 2 <= duration <= 20 or not 16 <= font_size <= 100:
-        raise ToolError("同屏条数范围 1–30，滚动时长 2–20 秒，字号 16–100（以 1080p 为基准）。")
+    if not density.is_integer() or not 1 <= density <= 30 or not 2 <= duration <= 24 or not 16 <= font_size <= 100:
+        raise ToolError("同屏条数范围 1–30，滚动时长 2–24 秒，字号 16–100（以 1080p 为基准）。")
     if not 10 <= area <= 100 or not 10 <= opacity <= 100:
         raise ToolError("显示区域和不透明度范围均为 10–100%。")
     keywords = compile_block_keywords(block_keywords)
@@ -881,7 +882,7 @@ def safe_name(name):
 
 
 def build(subtitle=None, video=None, track=None, danmaku=None, out_dir=None, name=None,
-          offset=0, subtitle_offset=0, density=6, duration=8, font_size=32):
+          offset=0, subtitle_offset=0, density=6, duration=DEFAULT_DANMAKU_DURATION, font_size=32):
     if bool(subtitle) == bool(video):
         raise ToolError("请选择一份原字幕，或一部用于提取字幕的影片。")
     if not danmaku or not out_dir:
@@ -965,6 +966,7 @@ NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS
 识别结果需核对片名、年份、时长，平台上架年份有时与上映年不同。
 弹幕偏移：正数延后、负数提前。不同剪辑版本可能无法只用一个偏移完全对齐。
 默认弹幕只在顶部 1/4 滚动，字号 32（1080p 基准）、不透明度 80%、最多同屏 6 条，屏蔽固定弹幕。
+默认 1× 每条滚动 12 秒，比旧版 8 秒慢约三分之一；0.5× 为 24 秒，2× 为 6 秒。
 同向弹幕留够安全间距即可接续进入，按同屏上限分散进入节奏，不再等待整批走完；原时间点不后移。
 默认过滤日期/时间打卡、报几刷、陪谁看、在吗/有人吗、重复字母数字及明显广告；“弹幕设置”可关闭。
 在“弹幕设置 → 屏蔽规则（内置＋自定义）”查看全部六条内置规则，可修改、停用、删除或恢复默认。
@@ -1874,7 +1876,7 @@ def materialize_subtitle(choice, video, progress=None, duration=None):
     return doc
 
 
-def synthesize(result, subtitle_index=0, offset=0, density=6, duration=8, font_size=32, progress=lambda _: None,
+def synthesize(result, subtitle_index=0, offset=0, density=6, duration=DEFAULT_DANMAKU_DURATION, font_size=32, progress=lambda _: None,
                *, area=25, opacity=80, block_scroll=False, block_fixed=True, block_color=False,
                avoid_subtitles=True, deduplicate=True, block_noise=True, block_keywords="", filter_rules=None):
     if not result.subtitles or not 0 <= subtitle_index < len(result.subtitles):
@@ -2218,7 +2220,7 @@ class DanmakuSettingsDialog:
                           ("block_scroll", "block_fixed", "block_color", "avoid_subtitles", "deduplicate", "block_noise")}
         self.variables["block_keywords"] = tk.StringVar(value=current["block_keywords"])
         self.variables.update({key: tk.DoubleVar(value=current[key]) for key in ("area", "opacity", "font_size")})
-        self.variables["speed"] = tk.DoubleVar(value=800 / current["duration"])
+        self.variables["speed"] = tk.DoubleVar(value=DEFAULT_DANMAKU_DURATION * 100 / current["duration"])
         self.variables["density"] = tk.StringVar(value=app.density.get())
         self.labels = {}
         ttk.Label(frame, text="弹幕设置", style="Title.TLabel").pack(anchor="w")
@@ -2266,7 +2268,7 @@ class DanmakuSettingsDialog:
         settings["filter_rules"] = copy.deepcopy(self.rule_rows)
         for key in ("area", "opacity", "font_size"):
             settings[key] = round(settings[key])
-        settings["duration"] = 800 / finite(self.variables["speed"].get(), "速度")
+        settings["duration"] = DEFAULT_DANMAKU_DURATION * 100 / finite(self.variables["speed"].get(), "速度")
         density = int(self.variables["density"].get())
         compile_block_keywords(settings["block_keywords"])
         compile_filter_rules(settings["filter_rules"])
@@ -2286,7 +2288,7 @@ class DanmakuSettingsDialog:
             self.labels["area"].set(f"顶部 {settings['area']}%")
             self.labels["opacity"].set(f"{settings['opacity']}%")
             self.labels["font_size"].set(f"{settings['font_size']}（1080p）")
-            self.labels["speed"].set(f"{8 / settings['duration']:.2g}× / {settings['duration']:.1f} 秒")
+            self.labels["speed"].set(f"{DEFAULT_DANMAKU_DURATION / settings['duration']:.2g}× / {settings['duration']:.1f} 秒")
             canvas = self.canvas
             canvas.delete("all")
             canvas.create_rectangle(0, 0, 512, 288 * effective / 100, fill="#203e50", outline="")

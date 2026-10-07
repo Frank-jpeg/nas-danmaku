@@ -135,11 +135,11 @@ class FilterRulesTests(unittest.TestCase):
     def test_render_uses_edited_rules_and_counts_custom_regex(self):
         rules = [custom_rule(r'广告\d+', name='数字广告')]
         stats = {}
-        comments = [d.Comment(0, '广告123'), d.Comment(.1, '正常剧情'), d.Comment(2, '在吗')]
+        comments = [d.Comment(0, '广告123'), d.Comment(.1, '正常剧情'), d.Comment(2.2, '在吗')]
         doc, omitted = d.render_comments(comments, (1920, 1080), filter_rules=rules, filter_stats=stats)
         self.assertEqual(omitted, 1)
         self.assertEqual(stats, {'noise': 0, 'keywords': 1})
-        self.assertEqual([row['Start'] for row in doc.events], ['0:00:00.10', '0:00:02.00'])
+        self.assertEqual([row['Start'] for row in doc.events], ['0:00:00.10', '0:00:02.20'])
 
 
 if __name__ == '__main__':

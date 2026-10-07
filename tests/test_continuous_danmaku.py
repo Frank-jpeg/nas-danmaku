@@ -14,30 +14,32 @@ def trajectory(row):
 class ContinuousDanmakuTests(unittest.TestCase):
     def test_dense_source_enters_continuously_with_same_screen_limit(self):
         comments = [d.Comment(i / 10, f'连续弹幕 {i}') for i in range(400)]
-        doc, omitted = d.render_comments(comments, (1920, 1080))
-        paths = [trajectory(row) for row in doc.events]
-        starts = [row[0] for row in paths]
-        self.assertGreater(len(starts), 25)
-        # 不再出现每 8 秒一批；原始评论有足量数据时持续约每 1.4 秒进入。
-        self.assertTrue(all(1.3 < b - a < 1.5 for a, b in zip(starts, starts[1:])))
-        self.assertEqual(len(doc.events) + omitted, len(comments))
-        for moment in (i / 100 for i in range(4800)):
-            self.assertLessEqual(sum(start <= moment < end for start, end, *_ in paths), 6)
-        # 至少有一行在前一条还没离场时接纳了后一条。
-        self.assertTrue(any(a[4] == b[4] and a[0] < b[0] < a[1]
-                            for a in paths for b in paths))
+        for duration, gap in ((8, 1.4), (12, 2), (24, 4)):
+            with self.subTest(duration=duration):
+                doc, omitted = d.render_comments(comments, (1920, 1080), duration=duration)
+                paths = [trajectory(row) for row in doc.events]
+                starts = [row[0] for row in paths]
+                self.assertGreaterEqual(len(starts), 10)
+                # 旧速度、新 1× 和新 0.5× 均持续进入，不能退回整批离场后再出现。
+                self.assertTrue(all(abs(b - a - gap) < .01 for a, b in zip(starts, starts[1:])))
+                self.assertEqual(len(doc.events) + omitted, len(comments))
+                for moment in (i / 100 for i in range(int((40 + duration) * 100))):
+                    self.assertLessEqual(sum(start <= moment < end for start, end, *_ in paths), 6)
+                # 至少有一行在前一条还没离场时接纳了后一条。
+                self.assertTrue(any(a[4] == b[4] and a[0] < b[0] < a[1]
+                                    for a in paths for b in paths))
 
     def test_fast_long_follower_does_not_catch_short_leader(self):
         for mode in (1, 6):
             comments = [d.Comment(0, '短', mode=mode), d.Comment(2, '长' * 60, mode=mode),
                         d.Comment(6, '长' * 60, mode=mode)]
-            doc, omitted = d.render_comments(comments, (1920, 1080), area=10, font_size=40, density=30)
+            doc, omitted = d.render_comments(comments, (1920, 1080), area=10, font_size=40, density=30, duration=8)
             self.assertEqual([row['Start'] for row in doc.events], ['0:00:00.00', '0:00:06.00'])
             self.assertEqual(omitted, 1)
 
     def test_long_tail_must_clear_entry_before_short_follower(self):
         comments = [d.Comment(0, '长' * 60), d.Comment(2, '短'), d.Comment(6, '短')]
-        doc, omitted = d.render_comments(comments, (1920, 1080), area=10, font_size=40, density=30)
+        doc, omitted = d.render_comments(comments, (1920, 1080), area=10, font_size=40, density=30, duration=8)
         self.assertEqual([row['Start'] for row in doc.events], ['0:00:00.00', '0:00:06.00'])
         self.assertEqual(omitted, 1)
 
@@ -69,7 +71,7 @@ class ContinuousDanmakuTests(unittest.TestCase):
             comments = [d.Comment(0, '前一条', mode=first_mode), d.Comment(4, '等待', mode=next_mode),
                         d.Comment(8, '下一条', mode=next_mode)]
             doc, omitted = d.render_comments(comments, (1920, 1080), density=30, area=10,
-                                            font_size=40, block_fixed=False)
+                                            font_size=40, block_fixed=False, duration=8)
             self.assertEqual([row['Start'] for row in doc.events], ['0:00:00.00', '0:00:08.00'])
             self.assertEqual(omitted, 1)
 
@@ -78,7 +80,7 @@ class ContinuousDanmakuTests(unittest.TestCase):
         doc, omitted = d.render_comments([d.Comment(t, str(t)) for t in source_times], (1920, 1080))
         self.assertEqual(omitted, 0)
         self.assertEqual([d.stamp(row['Start']) for row in doc.events], [round(t * 100) for t in source_times])
-        self.assertTrue(all(d.stamp(row['End']) - d.stamp(row['Start']) == 800 for row in doc.events))
+        self.assertTrue(all(d.stamp(row['End']) - d.stamp(row['Start']) == 1200 for row in doc.events))
 
 
 if __name__ == '__main__':

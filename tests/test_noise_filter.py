@@ -53,14 +53,14 @@ class NoiseFilterTests(unittest.TestCase):
 
     def test_filter_runs_before_lane_and_entry_budget_without_changing_raw_comments(self):
         comments = [d.Comment(0, '2026年10月7日打卡'), d.Comment(.1, '正常剧情讨论'),
-                    d.Comment(1.5, '在吗在吗'), d.Comment(1.6, '这个结尾很精彩'),
+                    d.Comment(2.2, '在吗在吗'), d.Comment(2.3, '这个结尾很精彩'),
                     d.Comment(3, '不想看见的指定词')]
         stats = {}
         doc, omitted = d.render_comments(comments, (1920, 1080),
                                          block_keywords='指定词', filter_stats=stats)
         self.assertEqual(stats, {'noise': 2, 'keywords': 1})
         self.assertEqual(omitted, 3)
-        self.assertEqual([row['Start'] for row in doc.events], ['0:00:00.10', '0:00:01.60'])
+        self.assertEqual([row['Start'] for row in doc.events], ['0:00:00.10', '0:00:02.30'])
         self.assertEqual(len(comments), 5)
         self.assertEqual(comments[0].text, '2026年10月7日打卡')
         unfiltered, omitted = d.render_comments([comments[0]], (1920, 1080), block_noise=False)

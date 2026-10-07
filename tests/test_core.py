@@ -99,7 +99,7 @@ class CoreTests(unittest.TestCase):
             result2 = d.build(subtitle=root / "原字幕.srt", danmaku=root / "弹幕.xml", out_dir=root, name="电影", offset=5)
             self.assertTrue(result2["output"].endswith("-v2.ass"))
             self.assertEqual(first.read_bytes(), before)
-            self.assertEqual(len(d.parse_ass(before.decode()).events), 4)
+            self.assertEqual(len(d.parse_ass(before.decode()).events), 3)  # 默认屏蔽固定弹幕
             self.assertEqual((root / "原字幕.srt").read_text(encoding="utf-8"), SRT)
 
     def test_filename_guard(self):

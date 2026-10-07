@@ -31,11 +31,13 @@ import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
 TEXT_CODECS = {"ass", "ssa", "subrip", "srt", "mov_text", "text", "webvtt"}
+DM_DEFAULTS = dict(font_size=32, duration=8, area=25, opacity=80, block_scroll=False,
+                   block_fixed=True, block_color=False, avoid_subtitles=True, deduplicate=True)
 
 
 class ToolError(Exception):
@@ -422,18 +424,29 @@ def parse_comments(text):
     return comments, skipped
 
 
-def render_comments(comments, resolution, offset=0, density=8, duration=8, font_size=44, progress=None):
+def render_comments(comments, resolution, offset=0, density=6, duration=8, font_size=32, progress=None,
+                    *, area=25, opacity=80, block_scroll=False, block_fixed=True, block_color=False,
+                    avoid_subtitles=True, deduplicate=True):
     width, height = resolution
     offset, duration, font_size = finite(offset, "弹幕偏移"), finite(duration, "滚动时长"), finite(font_size, "字号")
-    if not 1 <= int(density) <= 30 or not 2 <= duration <= 20 or not 16 <= font_size <= 100:
+    density, area, opacity = finite(density, "同屏条数"), finite(area, "显示区域"), finite(opacity, "不透明度")
+    if not density.is_integer() or not 1 <= density <= 30 or not 2 <= duration <= 20 or not 16 <= font_size <= 100:
         raise ToolError("同屏条数范围 1–30，滚动时长 2–20 秒，字号 16–100（以 1080p 为基准）。")
+    if not 10 <= area <= 100 or not 10 <= opacity <= 100:
+        raise ToolError("显示区域和不透明度范围均为 10–100%。")
     size = font_size * height / 1080
-    top, row_height = max(8, height * .035), size * 1.45
-    lanes = min(int(density), max(1, int((height * .68 - top) / row_height)))
+    top, row_height = height * .025, size * 1.45
+    bottom = height * min(area / 100, .68 if avoid_subtitles else 1)
+    lanes = int((bottom - top) / row_height)
+    if lanes < 1:
+        raise ToolError("当前显示区域放不下一行弹幕，请缩小字号或增大显示区域。")
     available = [-1.0] * lanes
     doc = Ass(styles={"Scroll": style("Scroll", round(size, 2))})
     doc.info.update(PlayResX=str(width), PlayResY=str(height), WrapStyle="2")
     doc.styles["Scroll"].update(Alignment="7", Outline=str(round(max(1, size / 22), 2)), MarginL="0", MarginR="0", MarginV="0")
+    alpha = round(255 * (1 - opacity / 100))
+    for key in ("PrimaryColour", "SecondaryColour", "OutlineColour", "BackColour"):
+        doc.styles["Scroll"][key] = f"&H{alpha:02X}" + doc.styles["Scroll"][key][-6:]
     seen, omitted = {}, 0
     total = len(comments)
     report(progress, "排列弹幕", 0, total, "条")
@@ -442,23 +455,36 @@ def render_comments(comments, resolution, offset=0, density=8, duration=8, font_
         if index and index % max(1, total // 100) == 0:
             report(progress, "排列弹幕", index, total, "条")
         at = comment.time + offset
-        message = escape_text(comment.text)[:120]
-        if at < 0 or (message in seen and at - seen[message] < 15):
+        fixed = comment.mode in (4, 5)
+        if (fixed and block_fixed) or (not fixed and block_scroll) or (block_color and comment.color != 0xFFFFFF):
             omitted += 1
             continue
-        lane = next((i for i, end in enumerate(available) if end <= at), None)
+        message = escape_text(comment.text)[:120]
+        if at < 0 or (deduplicate and message in seen and at - seen[message] < 15):
+            omitted += 1
+            continue
+        order = range(lanes - 1, -1, -1) if comment.mode == 4 else range(lanes)
+        lane = next((i for i in order if available[i] <= at), None)
+        if sum(end > at for end in available) >= density:
+            lane = None
         if lane is None:
             omitted += 1
             continue
         seen[message] = at
         available[lane] = at + duration
-        # 独占滚动行直到出屏，防止后发长弹幕追撞；底部 32% 留给台词。
+        # 所有模式共用行占用表；固定/反向弹幕也不能与滚动弹幕相撞。
         units = sum(1 if unicodedata.east_asian_width(c) in "WF" else .65 for c in message)
         length = max(size, units * size * 1.2)
         color = comment.color
         bgr = f"{color & 255:02X}{color >> 8 & 255:02X}{color >> 16 & 255:02X}"
         y = top + lane * row_height
-        tags = f"{{\\an7\\q2\\move({width + 10},{y:.2f},{-length:.2f},{y:.2f})\\c&H{bgr}&}}"
+        if fixed:
+            position = f"\\an8\\pos({width / 2:.2f},{y:.2f})"
+        elif comment.mode == 6:
+            position = f"\\an7\\move({-length:.2f},{y:.2f},{width + 10},{y:.2f})"
+        else:
+            position = f"\\an7\\move({width + 10},{y:.2f},{-length:.2f},{y:.2f})"
+        tags = f"{{{position}\\q2\\alpha&H{alpha:02X}&\\c&H{bgr}&}}"
         doc.events.append(event(round(at * 100), round((at + duration) * 100), tags + message, "Scroll"))
     if not doc.events:
         raise ToolError("偏移/过滤后没有可显示的弹幕，请调整参数。")
@@ -559,7 +585,7 @@ def safe_name(name):
 
 
 def build(subtitle=None, video=None, track=None, danmaku=None, out_dir=None, name=None,
-          offset=0, subtitle_offset=0, density=8, duration=8, font_size=44):
+          offset=0, subtitle_offset=0, density=6, duration=8, font_size=32):
     if bool(subtitle) == bool(video):
         raise ToolError("请选择一份原字幕，或一部用于提取字幕的影片。")
     if not danmaku or not out_dir:
@@ -632,6 +658,7 @@ NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS
 缓存和成品保存在 %LOCALAPPDATA%/NasDanmaku/cache，界面日志会显示具体目录。
 
 弹幕：按片名通过 360 影视查找电影平台链接，再向公开弹幕库按需请求；不需要你填密钥。
+“来源”可选自动或当前电影找到的平台。指定平台失败会提示，可自行换源；不会悄悄换成其他平台。
 公开服务： https://dmku.hls.one/ ；备用 https://danmu.zxz.ee/ 。
 在线字幕：迅雷、SubHD 按片名查询；射手按视频指纹查询；SubtitleCat 作为可能机翻的末位备用。
 这些外部服务可能变更/限流、没有某部电影的数据。失败会显示原因，支持修改片名重新识别或手动补选文件。
@@ -639,7 +666,11 @@ NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS
 
 识别结果需核对片名、年份、时长，平台上架年份有时与上映年不同。
 弹幕偏移：正数延后、负数提前。不同剪辑版本可能无法只用一个偏移完全对齐。
-字幕默认保留原样式；XML/JSON 弹幕重排，底部 32% 留给台词，最多 8 条同时滚动。
+默认弹幕只在顶部 1/4 滚动，字号 32（1080p 基准）、不透明度 80%、最多同屏 6 条，屏蔽固定弹幕。
+“弹幕设置”可调显示区域、字号、不透明度、速度及类型过滤；只影响弹幕，不改原台词字幕。
+勾选防挡字幕时，即使放大区域也会保留底部 32%；固定弹幕手动开启后同样限制在所选区域内。
+设置保留在当前窗口，重新启动恢复默认。调整后点确认合成，无需重新下载；已有 ASS 不会自动改变。
+手动导入的 ASS 已有排版，只支持时间偏移；要调整区域和字号请用在线弹幕或 XML/JSON。
 字幕与弹幕同属一条 ASS，播放时选择这条字幕即可。想仅看台词，选回原字幕轨。
 
 进度条表示当前步骤；切换步骤时会归零。没有可用总量时只显示等待/接收量和耗时。
@@ -1300,8 +1331,10 @@ def parse_public_comments(data):
                 color = "".join(c * 2 for c in color)
             color_int = int(color, 16) if re.fullmatch(r"[0-9a-fA-F]{6}", color) else 16777215
             at = finite(row[0])
-            if at >= 0 and message.strip():
-                comments.append(Comment(at, message, color_int, 1))
+            mode = {"right": 1, "scroll": 1, "top": 5, "bottom": 4, "left": 6,
+                    "1": 1, "4": 4, "5": 5, "6": 6}.get(str(row[1]).lower())
+            if at >= 0 and message.strip() and mode is not None:
+                comments.append(Comment(at, message, color_int, mode))
         except (ValueError, TypeError, ToolError):
             continue
     if not comments:
@@ -1311,6 +1344,8 @@ def parse_public_comments(data):
 
 def fetch_public_danmaku(movie, progress, platform=None):
     errors = []
+    if platform is not None and (platform not in PLATFORMS or platform not in movie["links"]):
+        raise ToolError("当前电影没有所选平台的链接，请选择列表中的其他来源。")
     # 最多两种平台，失败信息可见；不会对所有来源无限重试。
     keys = [platform] if platform else [k for k in PLATFORMS if k in movie["links"]][:2]
     for key in keys:
@@ -1438,7 +1473,9 @@ def materialize_subtitle(choice, video, progress=None, duration=None):
     return doc
 
 
-def synthesize(result, subtitle_index=0, offset=0, density=8, duration=8, font_size=44, progress=lambda _: None):
+def synthesize(result, subtitle_index=0, offset=0, density=6, duration=8, font_size=32, progress=lambda _: None,
+               *, area=25, opacity=80, block_scroll=False, block_fixed=True, block_color=False,
+               avoid_subtitles=True, deduplicate=True):
     if not result.subtitles or not 0 <= subtitle_index < len(result.subtitles):
         raise ToolError("还没有可合成的文字字幕。")
     if not result.comments and result.dm_ass is None:
@@ -1460,7 +1497,9 @@ def synthesize(result, subtitle_index=0, offset=0, density=8, duration=8, font_s
     else:
         shift = finite(offset, "弹幕偏移")
         comments = [c for c in result.comments if not length or c.time + shift < length]
-        dm, filtered = render_comments(comments, base.resolution, offset, density, duration, font_size, progress=progress)
+        dm, filtered = render_comments(comments, base.resolution, offset, density, duration, font_size, progress=progress,
+                                       area=area, opacity=opacity, block_scroll=block_scroll, block_fixed=block_fixed,
+                                       block_color=block_color, avoid_subtitles=avoid_subtitles, deduplicate=deduplicate)
         filtered += len(result.comments) - len(comments)
     progress("合并台词和弹幕")
     final = merge_ass(base, dm)
@@ -1560,12 +1599,136 @@ def progress_detail(update, elapsed):
     return detail + " · 本步已用 " + elapsed_text(elapsed)
 
 
+class DanmakuSettingsDialog:
+    def __init__(self, app):
+        self.app = app
+        self.window = tk.Toplevel(app.root)
+        self.window.title("弹幕设置")
+        self.window.resizable(False, False)
+        frame = ttk.Frame(self.window, padding=16)
+        frame.pack(fill="both", expand=True)
+        current = app.render_settings
+        self.variables = {key: tk.BooleanVar(value=current[key]) for key in
+                          ("block_scroll", "block_fixed", "block_color", "avoid_subtitles", "deduplicate")}
+        self.variables.update({key: tk.DoubleVar(value=current[key]) for key in ("area", "opacity", "font_size")})
+        self.variables["speed"] = tk.DoubleVar(value=800 / current["duration"])
+        self.variables["density"] = tk.StringVar(value=app.density.get())
+        self.labels = {}
+        ttk.Label(frame, text="弹幕设置", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(frame, text="应用后重新合成，电视加载新生成的字幕即可。", foreground="#606975").pack(anchor="w", pady=(2, 10))
+        row = ttk.Frame(frame)
+        row.pack(fill="x")
+        ttk.Label(row, text="屏蔽类型").pack(side="left", padx=(0, 10))
+        for key, label in (("block_scroll", "滚动"), ("block_fixed", "固定"), ("block_color", "彩色")):
+            ttk.Checkbutton(row, text=label, variable=self.variables[key], command=self.preview).pack(side="left", padx=8)
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(6, 10))
+        for key, label in (("avoid_subtitles", "防挡字幕（保留底部 32%）"), ("deduplicate", "过滤重复弹幕")):
+            ttk.Checkbutton(row, text=label, variable=self.variables[key], command=self.preview).pack(side="left", padx=(0, 12))
+        for key, label, low, high in (("area", "显示区域", 10, 100), ("opacity", "不透明度", 10, 100),
+                                      ("font_size", "弹幕字号", 16, 64), ("speed", "弹幕速度", 50, 200)):
+            row = ttk.Frame(frame)
+            row.pack(fill="x", pady=5)
+            ttk.Label(row, text=label, width=10).pack(side="left")
+            ttk.Scale(row, from_=low, to=high, variable=self.variables[key], command=lambda _: self.preview()).pack(side="left", fill="x", expand=True, padx=10)
+            self.labels[key] = tk.StringVar()
+            ttk.Label(row, textvariable=self.labels[key], width=17).pack(side="left")
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(6, 10))
+        ttk.Label(row, text="同屏最多", width=10).pack(side="left")
+        ttk.Spinbox(row, from_=1, to=30, width=5, textvariable=self.variables["density"], command=self.preview).pack(side="left", padx=10)
+        ttk.Label(row, text="条；区域放不下时自动减少", foreground="#606975").pack(side="left")
+        self.canvas = tk.Canvas(frame, width=512, height=288, background="#111c29", highlightthickness=0)
+        self.canvas.pack(pady=(0, 6))
+        self.note = tk.StringVar()
+        ttk.Label(frame, textvariable=self.note, foreground="#606975", wraplength=512).pack(anchor="w")
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(12, 0))
+        ttk.Button(row, text="恢复默认", command=self.reset).pack(side="left")
+        ttk.Button(row, text="应用设置", command=self.apply).pack(side="right")
+        ttk.Button(row, text="取消", command=self.window.destroy).pack(side="right", padx=6)
+        self.preview()
+
+    def values(self):
+        settings = {key: self.variables[key].get() for key in DM_DEFAULTS if key != "duration"}
+        for key in ("area", "opacity", "font_size"):
+            settings[key] = round(settings[key])
+        settings["duration"] = 800 / finite(self.variables["speed"].get(), "速度")
+        density = int(self.variables["density"].get())
+        return settings, density
+
+    def preview(self):
+        if not hasattr(self, "canvas"):
+            return
+        try:
+            settings, density = self.values()
+            effective = min(settings["area"], 68 if settings["avoid_subtitles"] else 100)
+            self.labels["area"].set(f"顶部 {settings['area']}%")
+            self.labels["opacity"].set(f"{settings['opacity']}%")
+            self.labels["font_size"].set(f"{settings['font_size']}（1080p）")
+            self.labels["speed"].set(f"{8 / settings['duration']:.2g}× / {settings['duration']:.1f} 秒")
+            canvas = self.canvas
+            canvas.delete("all")
+            canvas.create_rectangle(0, 0, 512, 288 * effective / 100, fill="#203e50", outline="")
+            canvas.create_line(0, 288 * effective / 100, 512, 288 * effective / 100, fill="#41b6cf", dash=(4, 4))
+            canvas.create_text(256, 170, text="电影画面", fill="#59697a", font=("Microsoft YaHei UI", 20))
+            canvas.create_text(256, 265, text="原台词字幕 · 样式保持不变", fill="white", font=("Microsoft YaHei UI", -13))
+            sample = [Comment(0, "上方滚动弹幕示意"), Comment(0, "弹幕字号与区域比例", 0x7ADDEF),
+                      Comment(0, "顶部固定弹幕", mode=5), Comment(0, "底部固定弹幕（仍在显示区域内）", mode=4)]
+            doc, _ = render_comments(sample, (1920, 1080), density=density, **settings)
+            for number, row in enumerate(doc.events):
+                position = re.search(r"\\(?:move|pos)\([^,]+,([\d.]+)", row["Text"])
+                text_value = re.sub(r"\{[^}]*\}", "", row["Text"])
+                color = re.search(r"\\c&H([0-9A-F]{6})&", row["Text"])[1]
+                rgb = [int(color[i:i+2], 16) for i in (4, 2, 0)]
+                bg = (32, 62, 80)
+                blended = '#' + ''.join(f'{round(c * settings["opacity"] / 100 + b * (1 - settings["opacity"] / 100)):02x}' for c, b in zip(rgb, bg))
+                fixed = r"\pos" in row["Text"]
+                canvas.create_text(256 if fixed else 110 + number * 30, float(position[1]) * 288 / 1080,
+                                   text=text_value, anchor="n" if fixed else "nw", fill=blended,
+                                   font=("Microsoft YaHei UI", -max(1, round(settings["font_size"] * 288 / 1080))))
+            extra = "；防挡字幕已将实际范围限制为顶部 68%" if settings["area"] > effective else ""
+            self.note.set("16:9 比例示意；字号按画面高度缩放，电视字体可能略有差异" + extra + "。")
+        except (ToolError, ValueError, tk.TclError, ZeroDivisionError) as exc:
+            self.note.set("请检查设置：" + str(exc))
+
+    def reset(self):
+        for key, value in DM_DEFAULTS.items():
+            if key != "duration":
+                self.variables[key].set(value)
+        self.variables["speed"].set(100)
+        self.variables["density"].set("6")
+        self.preview()
+
+    def apply(self):
+        if self.app.busy:
+            self.note.set("当前任务正在处理，请结束后再应用设置。")
+            return
+        if self.app.result and self.app.result.dm_ass:
+            self.note.set("当前已导入排版好的 ASS，只支持偏移；请选择在线弹幕或 XML/JSON 后调整。")
+            return
+        try:
+            settings, density = self.values()
+            if settings["block_scroll"] and settings["block_fixed"]:
+                raise ToolError("滚动和固定不能同时屏蔽，否则没有弹幕可显示。")
+            samples = [Comment(0, "检查滚动"), Comment(0, "检查固定", mode=5)]
+            render_comments(samples, (1920, 1080), density=density, **settings)
+        except (ToolError, ValueError, tk.TclError, ZeroDivisionError) as exc:
+            self.note.set("请检查设置：" + str(exc))
+            return
+        self.app.render_settings = settings
+        self.app.density.set(str(density))
+        self.app.settings_summary.set(self.app.settings_description())
+        self.app.status.set("弹幕设置已应用；点击确认合成后生效，无需重新下载。")
+        self.window.destroy()
+
+
 class App:
     def __init__(self, root, initial=""):
         self.root = root
         root.title("字幕＋弹幕 · 一键合成 v" + VERSION)
-        root.geometry("860x650")
-        root.minsize(780, 620)
+        root.geometry("900x700")
+        root.minsize(860, 680)
         self.result = None
         self.pending_output = None
         self.busy = False
@@ -1581,13 +1744,18 @@ class App:
         self.status = tk.StringVar(value="选影片 → 自动查找 → 核对字幕与弹幕 → 确认合成")
         self.progress_text = tk.StringVar(value="进度按当前步骤计算；切换步骤时归零")
         self.offset = tk.StringVar(value="0")
-        self.density = tk.StringVar(value="8")
+        self.density = tk.StringVar(value="6")
+        self.render_settings = dict(DM_DEFAULTS)
+        self.platform = tk.StringVar(value="自动")
+        self.platform_keys = [None]
+        self.settings_dialog = None
+        self.settings_summary = tk.StringVar(value=self.settings_description())
         self.output_text = tk.StringVar(value="输出到：所选影片的原目录")
         style = ttk.Style(root)
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", 17, "bold"))
         style.configure("TLabel", font=("Microsoft YaHei UI", 10))
         style.configure("TButton", padding=(8, 4))
-        p = ttk.Frame(root, padding=16)
+        p = ttk.Frame(root, padding=12)
         p.pack(fill="both", expand=True)
         head = ttk.Frame(p)
         head.pack(fill="x")
@@ -1627,6 +1795,10 @@ class App:
         self.movie_box = ttk.Combobox(row, state="readonly", textvariable=self.movie)
         self.movie_box.pack(side="left", fill="x", expand=True)
         self.movie_box.bind("<<ComboboxSelected>>", self.change_movie)
+        ttk.Label(row, text="来源").pack(side="left", padx=(8, 4))
+        self.platform_box = ttk.Combobox(row, state="disabled", textvariable=self.platform, values=["自动"], width=10)
+        self.platform_box.pack(side="left")
+        self.platform_box.bind("<<ComboboxSelected>>", self.change_platform)
         self.manual_dm = ttk.Button(row, text="补选弹幕…", command=self.pick_danmaku)
         self.manual_dm.pack(side="left", padx=(8, 0))
         ttk.Label(box, textvariable=self.dm_text, wraplength=760, foreground="#31566e").pack(anchor="w", pady=(8, 0))
@@ -1638,6 +1810,8 @@ class App:
         ttk.Label(row, text="最多同屏").pack(side="left", padx=(22, 0))
         ttk.Spinbox(row, from_=1, to=30, textvariable=self.density, width=5).pack(side="left", padx=6)
         ttk.Label(row, text="条").pack(side="left")
+        self.settings_button = ttk.Button(row, textvariable=self.settings_summary, command=self.open_settings)
+        self.settings_button.pack(side="right")
         ttk.Label(p, textvariable=self.output_text, wraplength=790).pack(anchor="w", pady=(0, 8))
         row = ttk.Frame(p)
         row.pack(fill="x")
@@ -1659,6 +1833,18 @@ class App:
         self.root.after(100, self.poll)
         if initial:
             self.root.after(200, self.scan)
+
+    def settings_description(self):
+        s = self.render_settings
+        effective = min(s["area"], 68 if s["avoid_subtitles"] else 100)
+        return f"弹幕设置 · 顶部 {effective}% / 字号 {s['font_size']}"
+
+    def open_settings(self):
+        if self.busy or (self.result and self.result.dm_ass):
+            return
+        if self.settings_dialog and self.settings_dialog.window.winfo_exists():
+            return
+        self.settings_dialog = DanmakuSettingsDialog(self)
 
     def help(self):
         win = tk.Toplevel(self.root)
@@ -1716,6 +1902,9 @@ class App:
         ready = not self.busy and self.result is not None and bool(self.result.subtitles) and bool(self.result.comments or self.result.dm_ass)
         self.generate_button.configure(state="normal" if ready else "disabled")
         self.retry_copy_button.configure(state="normal" if not self.busy and self.pending_output else "disabled")
+        has_platforms = self.result is not None and bool(self.result.movies) and self.movie_box.current() >= 0
+        self.platform_box.configure(state="readonly" if not self.busy and has_platforms else "disabled")
+        self.settings_button.configure(state="disabled" if self.busy or (self.result and self.result.dm_ass) else "normal")
 
     def background(self, work, done):
         if self.busy:
@@ -1785,6 +1974,9 @@ class App:
         self.pending_output = None
         self.sub_box.configure(values=[])
         self.movie_box.configure(values=[])
+        self.platform_keys = [None]
+        self.platform_box.configure(values=["自动"])
+        self.platform.set("自动")
         self.subtitle.set("正在识别…")
         self.movie.set("正在查找…")
         self.dm_text.set("正在获取…")
@@ -1806,6 +1998,7 @@ class App:
                 self.movie_box.current(0)
             else:
                 self.movie.set("未匹配到电影（可以修正片名重查）")
+            self.refresh_platforms()
             self.show_danmaku()
             self.output_text.set("输出到：" + str(result.video.with_name(f"弹幕版-{result.video.stem}.ass")))
             for warning in result.warnings:
@@ -1821,24 +2014,44 @@ class App:
             self.dm_text.set(f"已获取 {len(r.comments):,} 条 · {r.danmaku_source}\n预览：{snippets}")
         elif r and r.dm_ass:
             self.dm_text.set(f"已导入 {len(r.dm_ass.events)} 行 ASS 弹幕；保留原字号/密度，画布需与台词相同。")
+            self.settings_summary.set("ASS 原有排版（仅偏移）")
         else:
             self.dm_text.set("尚未获取有效弹幕。可切换候选影片，或修正片名重查。")
+        if not (r and r.dm_ass):
+            self.settings_summary.set(self.settings_description())
+
+    def refresh_platforms(self):
+        selected = self.platform.get()
+        index = self.movie_box.current()
+        movie = self.result.movies[index] if self.result and 0 <= index < len(self.result.movies) else None
+        self.platform_keys = [None] + [key for key in PLATFORMS if movie and key in movie["links"]]
+        labels = ["自动"] + [PLATFORMS[key] for key in self.platform_keys[1:]]
+        self.platform_box.configure(values=labels)
+        self.platform_box.current(labels.index(selected) if selected in labels else 0)
+
+    def change_platform(self, _=None):
+        self.change_movie()
 
     def change_movie(self, _=None):
         index = self.movie_box.current()
         if self.busy or not self.result or not 0 <= index < len(self.result.movies):
             return
+        self.refresh_platforms()
+        platform = self.platform_keys[self.platform_box.current()]
         r = self.result
         r.comments, r.dm_ass = [], None
+        r.danmaku_source, r.danmaku_url = "", ""
         self.show_danmaku()
         def done(value):
             r.comments, r.danmaku_source, r.danmaku_url = value
             self.show_danmaku()
-            self.status.set("已取得新候选的弹幕，请核对字幕后确认。")
+            self.status.set("已切换弹幕来源，请核对后确认合成。")
         def work():
-            value = fetch_public_danmaku(r.movies[index], self.progress)
-            r.comments, r.danmaku_source, r.danmaku_url = value
-            cache_danmaku(r, self.progress)
+            value = fetch_public_danmaku(r.movies[index], self.progress, platform=platform)
+            cached = copy.copy(r)
+            cached.comments, cached.danmaku_source, cached.danmaku_url = value
+            cache_danmaku(cached, self.progress)
+            r.workspace = cached.workspace
             return value
         self.background(work, done)
 
@@ -1886,7 +2099,7 @@ class App:
                     self.result.dm_ass = None
                 self.result.danmaku_source = "手动补选 · " + Path(path).name
                 cache_danmaku(self.result)
-                self.movie.set(self.result.danmaku_source)
+                self.platform.set("手动导入")
                 self.show_danmaku()
                 self.update_ready()
             except Exception as exc:
@@ -1904,10 +2117,11 @@ class App:
             offset, density = finite(self.offset.get()), int(self.density.get())
         except (ToolError, ValueError, OSError) as exc:
             return messagebox.showerror("请检查输入", str(exc))
-        self.background(lambda: synthesize(r, index, offset, density, progress=self.progress), self.show_output)
+        settings = dict(self.render_settings)
+        self.background(lambda: synthesize(r, index, offset, density, progress=self.progress, **settings), self.show_output)
 
     def show_output(self, value):
-        self.log(f"台词 {value['subtitle_lines']} 行，弹幕 {value['danmaku_lines']} 条；限流/去重 {value['filtered']} 条。")
+        self.log(f"台词 {value['subtitle_lines']} 行，弹幕 {value['danmaku_lines']} 条；过滤/去重/限流 {value['filtered']} 条。")
         if value.get("saved", True):
             self.pending_output = None
             self.status.set("合成完成，已保存到影片原目录。")

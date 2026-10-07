@@ -12,7 +12,7 @@ import nas_danmaku as d
 class FFmpegTests(unittest.TestCase):
     def test_generated_video_extract_merge_and_pgs_guard(self):
         with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp)
+            folder = Path(tmp).resolve()
             subtitle = folder / 'sample.srt'
             subtitle.write_text('1\n00:00:00,500 --> 00:00:02,500\n测试台词\n', encoding='utf-8')
             video = folder / 'sample.mkv'

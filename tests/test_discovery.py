@@ -29,7 +29,7 @@ SEARCH_REPLY = {'data': {'longData': {'rows': [
 class AutoTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.folder = Path(self.temp.name)
+        self.folder = Path(self.temp.name).resolve()
         self.video = self.folder / '流浪地球.2019.1080p.mkv'
         self.video.write_bytes(bytes(range(256)) * 256)
         self.meta = {'streams': [{'index': 1, 'codec_type': 'subtitle', 'codec_name': 'ass', 'tags': {'language': 'chi'}}], 'format': {'duration': '60'}}

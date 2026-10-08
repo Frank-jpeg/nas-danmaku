@@ -43,6 +43,17 @@ class UXDataTests(UXFixture, unittest.TestCase):
         self.assertFalse(good[0].partial)
         self.assertEqual(good[0].comments[0].text, '完整')
 
+    def test_public_bilibili_cache_is_retried_and_replaced_when_direct_returns(self):
+        result = d.ScanResult(None, {}, {}, (), workspace=self.folder)
+        old = d.DanmakuSource('bilibili1', [d.Comment(1, '旧缓存')],
+            '哔哩哔哩 · 公共弹幕库备用（部分获取：第三方缓存，完整性未验证）')
+        result.source_catalog[d.movie_source_key(MOVIE)] = [old]
+        with patch.object(d, 'fetch_public_danmaku', return_value=([d.Comment(1, '直连评论')], '哔哩哔哩 · 直连 XML＋分段', 'url')) as fetch:
+            updated = d.discover_danmaku_sources(result, MOVIE, retry_failed=True)
+        fetch.assert_called_once()
+        self.assertEqual(updated[0].comments[0].text, '直连评论')
+        self.assertFalse(updated[0].partial)
+
     def test_first_source_is_published_while_second_is_still_waiting(self):
         ready, release = threading.Event(), threading.Event()
         movie = {'links': {'qq': 'https://v.qq.com/test', 'qiyi': 'https://www.iqiyi.com/test'}}

@@ -79,6 +79,33 @@ class BilibiliTests(unittest.TestCase):
             comments, source, _ = d.fetch_public_danmaku(MOVIE, None, 'bilibili1')
         self.assertEqual(comments[0].text, '公共弹幕')
         self.assertIn('公益', source)
+        option = d.DanmakuSource('bilibili1', comments, source)
+        self.assertTrue(option.partial)
+        self.assertIn('第三方缓存', option.label)
+        self.assertIn('完整性未验证', source)
+
+    def test_backup_notice_is_excluded_and_bilibili_fallback_can_be_retried(self):
+        raw = ('<i><d p="1,5,25,16777215">有476条弹幕正在赶来，请遵守弹幕礼仪，祝您观影愉快~</d>'
+               '<d p="20,1,25,16777215">真实评论</d></i>').encode()
+        with patch.object(d, 'fetch_bilibili_danmaku', side_effect=d.ToolError('未返回 CID')), \
+                patch.object(d, 'web_json', return_value={'code': 403, 'msg': '未获取到cid！'}), \
+                patch.object(d, 'web_bytes', return_value=raw):
+            comments, source, _ = d.fetch_public_danmaku(MOVIE, None, 'bilibili1')
+        self.assertEqual([comment.text for comment in comments], ['真实评论'])
+        self.assertTrue(d.DanmakuSource('bilibili1', comments, source).partial)
+        self.assertIn('第三方缓存', source)
+
+    def test_public_notice_filter_keeps_ordinary_discussion_and_rejects_notice_only(self):
+        notice = '有476条弹幕正在赶来，请遵守弹幕礼仪，祝您观影愉快~'
+        real = '才476条弹幕吗？这么好的电影'
+        data = {'code': 23, 'danmuku': [[1, 'top', '#fff', '', notice], [2, 'right', '#fff', '', real]]}
+        self.assertEqual([comment.text for comment in d.parse_public_comments(data)], [real])
+        raw = ('<i><d p="1,5,25,16777215">' + notice + '</d></i>').encode()
+        with patch.object(d, 'fetch_bilibili_danmaku', side_effect=d.ToolError('未返回 CID')), \
+                patch.object(d, 'web_json', return_value={'code': 403}), \
+                patch.object(d, 'web_bytes', return_value=raw):
+            with self.assertRaisesRegex(d.ToolError, '仅返回了系统提示'):
+                d.fetch_public_danmaku(MOVIE, None, 'bilibili1')
 
     def test_p_parameter_is_preserved_and_uses_selected_cid(self):
         movie = {'links': {'bilibili1': 'https://www.bilibili.com/video/BV123?p=2&tracking=x'}}

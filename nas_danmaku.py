@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.9.0"
+VERSION = "2.9.1"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -1078,6 +1078,8 @@ NAS 写回失败会保留本机成品和待写回记录，重启后可恢复；�
 选中电影后，自动核实其已找到链接的各个平台，显示来源和实际取得的原始弹幕条数。
 “来源”只列出已取得并缓存的弹幕，切换直接用本机缓存。未取得的来源单独标注，详细原因见日志。
 “重查来源”重试未取得、未完成及部分取得的项目，保留完整成功来源；补取失败仍保留原数据。
+B 站直连失败后使用第三方缓存，会标注“第三方缓存，可重试”；条数仅代表本次取得量，完整性未验证。
+公共源插入的“有多少条弹幕正在赶来”等系统提示不计入评论，也不参与合成。
 顶部“弹弹play”按钮会显示已启用、已停用或未配置。已配置后自动查询，日常使用不必打开。
 设置窗口直接填入已保存的 AppId 和密钥；密钥默认以圆点显示，点“显示”可查看、点“隐藏”可遮住。
 启用后优先匹配文件前 16 MB 的 MD5；匹配失败继续按片名搜索，官方候选进入电影列表。
@@ -2019,6 +2021,12 @@ def canonical_platform_url(url):
     return urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path, query, ""))
 
 
+def public_danmaku_notice(message):
+    """Recognize notices inserted by public providers, not viewer comments."""
+    return bool(re.search(r"有\s*\d+\s*条弹幕列队来袭", message) or re.fullmatch(
+        r"\s*有\s*\d+\s*条弹幕正在赶来[，,]\s*请遵守弹幕礼仪[，,]\s*祝您观影愉快[~～!！。\s]*", message))
+
+
 def parse_public_comments(data):
     if not isinstance(data, dict) or data.get("code") != 23:
         raise ToolError("公开弹幕源未返回有效弹幕。")
@@ -2029,7 +2037,7 @@ def parse_public_comments(data):
             if not isinstance(row, list) or len(row) < 5:
                 continue
             message = str(row[4])
-            if re.search(r"有\s*\d+\s*条弹幕列队来袭", message):
+            if public_danmaku_notice(message):
                 continue
             color = str(row[2] or "#ffffff").lstrip("#")
             if len(color) == 3:
@@ -2227,18 +2235,20 @@ def fetch_public_danmaku(movie, progress, platform=None):
         if key not in movie["links"]:
             continue
         url = canonical_platform_url(movie["links"][key])
+        fallback_note = ""
         if key == "bilibili1":
             try:
                 return fetch_bilibili_danmaku(url, progress)
             except ToolError as exc:
                 errors.append(str(exc))
                 report(progress, f"B 站直连失败，尝试公共弹幕库：{exc}")
+                fallback_note = "（部分获取：第三方缓存，完整性未验证）"
         try:
             data = web_json(PUBLIC_DANMAKU + "?" + urllib.parse.urlencode({"ac": "dm", "url": url}),
                             progress=progress, message=f"下载{PLATFORMS[key]}弹幕（主源）")
             report(progress, "解析弹幕")
             comments = parse_public_comments(data)
-            return comments, PLATFORMS[key] + " · 公益弹幕库", url
+            return comments, PLATFORMS[key] + " · 公益弹幕库" + fallback_note, url
         except ToolError as exc:
             errors.append(str(exc))
         try:
@@ -2246,7 +2256,10 @@ def fetch_public_danmaku(movie, progress, platform=None):
                             progress=progress, message=f"下载{PLATFORMS[key]}弹幕（备用源）")
             report(progress, "解析弹幕")
             comments, _ = parse_comments(raw.decode("utf-8-sig"))
-            return comments, PLATFORMS[key] + " · 公共弹幕库备用", url
+            comments = [comment for comment in comments if not public_danmaku_notice(comment.text)]
+            if not comments:
+                raise ToolError("备用弹幕源仅返回了系统提示，没有可用评论。")
+            return comments, PLATFORMS[key] + " · 公共弹幕库备用" + fallback_note, url
         except (ToolError, UnicodeError) as exc:
             errors.append(str(exc))
     raise ToolError("未能取得这部影片的弹幕。" + ("；".join(dict.fromkeys(errors)) if errors else "没有受支持的平台链接。"))
@@ -2271,7 +2284,10 @@ class DanmakuSource:
 
     @property
     def label(self):
-        return (f"{PLATFORM_NAMES[self.platform]} · {len(self.comments):,} 条" + ("（部分取得，可重试）" if self.partial else "")) if self.available else f"{PLATFORM_NAMES[self.platform]} · 未取得"
+        if not self.available:
+            return f"{PLATFORM_NAMES[self.platform]} · 未取得"
+        suffix = "（第三方缓存，可重试）" if self.partial and "第三方缓存" in self.source else "（部分取得，可重试）" if self.partial else ""
+        return f"{PLATFORM_NAMES[self.platform]} · {len(self.comments):,} 条" + suffix
 
 
 def movie_source_key(movie):

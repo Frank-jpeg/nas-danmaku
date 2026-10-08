@@ -266,11 +266,65 @@ class UXGuiTests(UXFixture, unittest.TestCase):
                 yield from descendants(child)
         widgets = list(descendants(self.app.dandan_dialog))
         entries = [w for w in widgets if isinstance(w, d.ttk.Entry)]
+        self.assertEqual(self.app.dandan_summary.get(), '弹弹play · 已停用')
         self.assertEqual(entries[0].get(), 'testapp')
         self.assertEqual(entries[1].get(), '')
         self.assertTrue(entries[1].cget('show'))
+        self.assertEqual(entries[0].master.winfo_manager(), '')
+        edit = next(w for w in widgets if isinstance(w, d.ttk.Button) and w.cget('text') == '修改凭证…')
+        edit.invoke()
+        self.assertEqual(entries[0].master.winfo_manager(), 'pack')
         enabled = next(w for w in widgets if isinstance(w, d.ttk.Checkbutton))
         self.assertFalse(enabled.instate(['selected']))
+
+    def test_saved_dandan_status_is_visible_without_decryption_or_network(self):
+        d.save_local_json('dandanplay.local.json', dict(version=1, app_id='testapp', enabled=True, protected_secret='encrypted'))
+        with patch.object(d, 'dandan_protect') as decrypt, patch.object(d, 'dandan_request') as network:
+            self.app.open_dandan_settings()
+        self.assertEqual(self.app.dandan_summary.get(), '弹弹play · 已启用')
+        state = d.dandan_setup_state()
+        self.assertTrue(state['configured'])
+        self.assertNotIn('protected_secret', state)
+        self.assertNotIn('secret', state)
+        decrypt.assert_not_called()
+        network.assert_not_called()
+
+    def test_dandan_disable_preserves_key_and_refreshes_main_status(self):
+        d.save_local_json('dandanplay.local.json', dict(version=1, app_id='testapp', enabled=True, protected_secret='encrypted'))
+        self.app.open_dandan_settings()
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        widgets = list(descendants(self.app.dandan_dialog))
+        enabled = next(w for w in widgets if isinstance(w, d.ttk.Checkbutton))
+        enabled.invoke()
+        save = next(w for w in widgets if isinstance(w, d.ttk.Button) and w.cget('text') == '保存并验证')
+        with patch.object(d, 'dandan_request') as network:
+            save.invoke()
+            self.wait()
+        network.assert_not_called()
+        saved = d.load_local_json('dandanplay.local.json', {})
+        self.assertEqual(saved['protected_secret'], 'encrypted')
+        self.assertFalse(saved['enabled'])
+        self.assertEqual(self.app.dandan_summary.get(), '弹弹play · 已停用')
+
+    def test_unconfigured_dandan_dialog_shows_inputs_and_corrupt_config_is_explicit(self):
+        self.app.open_dandan_settings()
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        entries = [w for w in descendants(self.app.dandan_dialog) if isinstance(w, d.ttk.Entry)]
+        self.assertEqual(self.app.dandan_summary.get(), '弹弹play · 未配置')
+        self.assertEqual(entries[0].master.winfo_manager(), 'pack')
+        self.app.dandan_dialog.destroy()
+        path = d.filter_rules_path().with_name('dandanplay.local.json')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{broken', encoding='utf-8')
+        self.app.open_dandan_settings()
+        self.assertEqual(self.app.dandan_summary.get(), '弹弹play · 配置异常')
+        self.assertEqual(path.read_text(encoding='utf-8'), '{broken')
 
     def test_multiple_official_episodes_stay_unselected_until_user_chooses(self):
         video = self.folder / '电影.mkv'

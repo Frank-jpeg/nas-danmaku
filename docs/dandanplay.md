@@ -24,7 +24,9 @@
 | 通过标题搜索节目 | `GET /api/v2/search/episodes` |
 | 获取指定节目的弹幕 | `GET /api/v2/comment/{episodeId}` |
 
-点击主窗口“弹弹play接入”，填写自己的 AppId 和 AppSecret 后保存并验证。已有密钥时留空沿用；取消启用后保存即可停用。配置位于 `%LOCALAPPDATA%/NasDanmaku/dandanplay.local.json`，密钥以 Windows 当前用户 DPAPI 加密，配置覆盖前备份到 `D:/临时备份/NasDanmaku`。非 Windows 可以通过 `DANDANPLAY_APP_ID` 和 `DANDANPLAY_APP_SECRET` 环境变量提供凭证。
+2.8.2 起主窗口“弹弹play”按钮直接显示已启用、已停用、未配置或配置异常。首次使用时填写 AppId 和 AppSecret 后保存并验证；已配置时明确显示“凭证已保存，无需重复填写”，默认收起凭证输入框，点击“修改凭证”才展开。旧密钥不回显，新密钥留空沿用；取消启用后保存即可停用，保留原密钥。读取界面状态不解密密钥、不发起网络请求，不代表已经验证网络连接。
+
+配置位于 `%LOCALAPPDATA%/NasDanmaku/dandanplay.local.json`，密钥以 Windows 当前用户 DPAPI 加密，配置覆盖前备份到 `D:/临时备份/NasDanmaku`。非 Windows 可以通过 `DANDANPLAY_APP_ID` 和 `DANDANPLAY_APP_SECRET` 环境变量提供凭证；界面会标注环境变量优先。
 
 认证使用 `X-AppId`、`X-Timestamp` 和 `X-Signature`。签名为 `Base64(SHA256(AppId + Timestamp + Path + AppSecret))`，Path 不含查询参数，使用 SHA256 原始摘要，不发送明文密钥。跨域跳转清除认证头。
 

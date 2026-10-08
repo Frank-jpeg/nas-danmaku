@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.8.1"
+VERSION = "2.8.2"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -1075,7 +1075,8 @@ NAS 写回失败会保留本机成品和待写回记录，重启后可恢复；�
 选中电影后，自动核实其已找到链接的各个平台，显示来源和实际取得的原始弹幕条数。
 “来源”只列出已取得并缓存的弹幕，切换直接用本机缓存。未取得的来源单独标注，详细原因见日志。
 “重查来源”重试未取得、未完成及部分取得的项目，保留完整成功来源；补取失败仍保留原数据。
-官方接入：顶部“弹弹play接入”填写 AppId/AppSecret 后保存并验证；密钥仅在本机加密保存。
+顶部“弹弹play”按钮会显示已启用、已停用或未配置。已配置后自动查询，日常使用不必打开。
+设置窗口会明确显示凭证已保存；只有点击“修改凭证”才展开输入框。旧密钥不回显，无需重复填写。
 启用后优先匹配文件前 16 MB 的 MD5；匹配失败继续按片名搜索，官方候选进入电影列表。
 片名搜索优先查询官方 TMDB 电影目录及详情，按年份和中英文别名核对，未命中再查节目目录。
 模糊候选会核对片名；多个官方候选需在列表中选择具体电影或剧集，不会默认使用第一集。
@@ -1219,6 +1220,20 @@ def save_dandan_config(app_id, secret, enabled):
     save_local_json("dandanplay.local.json", data)
 
 
+def dandan_setup_state():
+    """UI metadata only: never return or decrypt the saved secret for display."""
+    try:
+        data = load_local_json("dandanplay.local.json", dict(version=1, app_id="", enabled=True))
+    except ToolError as exc:
+        return dict(label="配置异常", app_id="", enabled=False, configured=False, environment=False, error=str(exc))
+    app_id = os.environ.get("DANDANPLAY_APP_ID", "") or data.get("app_id", "")
+    configured = bool(app_id and (os.environ.get("DANDANPLAY_APP_SECRET") or data.get("protected_secret")))
+    enabled = bool(data.get("enabled") or os.environ.get("DANDANPLAY_APP_ID"))
+    return dict(label=("已启用" if enabled else "已停用") if configured else "未配置", app_id=app_id,
+                enabled=enabled, configured=configured,
+                environment=bool(os.environ.get("DANDANPLAY_APP_ID") or os.environ.get("DANDANPLAY_APP_SECRET")), error="")
+
+
 def dandan_headers(app_id, secret, path, timestamp=None):
     timestamp = str(int(time.time()) if timestamp is None else timestamp)
     path = urllib.parse.urlsplit(path).path
@@ -1235,7 +1250,7 @@ def dandan_request(path, payload=None, progress=None, *, use_cache=True):
         raise ToolError("不支持的弹弹play接口。")
     config = dandan_config()
     if not config["enabled"] or not config["app_id"] or not config["secret"]:
-        raise ToolError("请先在“弹弹play接入”中配置并启用官方来源。")
+        raise ToolError("请先点击顶部“弹弹play”按钮，配置并启用官方来源。")
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") if payload is not None else None
     cache_key = hashlib.sha256(config["app_id"].encode() + path.encode() + (body or b"")).hexdigest()
     cache = filter_rules_path().parent / "cache" / "dandanplay" / (cache_key + ".json")
@@ -3073,6 +3088,8 @@ class App:
         self.source_status = tk.StringVar(value="选中电影后自动查询各平台，只列出已取得弹幕的可选来源。")
         self.settings_dialog = None
         self.dandan_dialog = None
+        self.dandan_summary = tk.StringVar()
+        self.refresh_dandan_status()
         self.settings_summary = tk.StringVar(value=self.settings_description())
         self.output_text = tk.StringVar(value="输出到：所选影片的原目录")
         self.result_summary = tk.StringVar()
@@ -3086,7 +3103,7 @@ class App:
         ttk.Label(head, text="字幕＋弹幕", style="Title.TLabel").pack(side="left")
         ttk.Button(head, text="使用说明", command=self.help).pack(side="right")
         ttk.Button(head, text="网页找字幕", command=self.subtitle_sites).pack(side="right", padx=6)
-        ttk.Button(head, text="弹弹play接入", command=self.open_dandan_settings).pack(side="right", padx=6)
+        ttk.Button(head, textvariable=self.dandan_summary, command=self.open_dandan_settings).pack(side="right", padx=6)
         ttk.Label(p, text="选择一部电影，找到台词和弹幕，合成一条字幕放回原目录。", foreground="#606975").pack(anchor="w", pady=(4, 10))
         row = ttk.Frame(p)
         row.pack(fill="x")
@@ -3187,32 +3204,55 @@ class App:
         effective = min(s["area"], 68 if s["avoid_subtitles"] else 100)
         return f"弹幕设置 · 顶部 {effective}% / 字号 {s['font_size']}"
 
+    def refresh_dandan_status(self):
+        state = dandan_setup_state()
+        self.dandan_summary.set("弹弹play · " + state["label"])
+        return state
+
     def open_dandan_settings(self):
         if self.busy:
             return
         if self.dandan_dialog and self.dandan_dialog.winfo_exists():
             return
         win = self.dandan_dialog = tk.Toplevel(self.root)
-        win.title("弹弹play官方接入")
-        body, footer = scrollable_window(win, 660, 450)
-        try:
-            current = load_local_json("dandanplay.local.json", dict(version=1, app_id="", enabled=True))
-        except ToolError as exc:
-            current = dict(app_id="", enabled=False)
-            self.log(str(exc))
-        wrapped_label(body, text="弹弹play开放弹幕网络 · 官方来源\n启用后识别影片会读取前 16 MB 计算指纹，发送文件名、指纹、大小和时长；不上传影片内容。")
-        app_id = tk.StringVar(value=current.get("app_id", ""))
+        win.title("弹弹play设置")
+        body, footer = scrollable_window(win, 660, 470)
+        current = self.refresh_dandan_status()
+        summary = tk.StringVar()
+        def show_summary(state):
+            if state["configured"]:
+                saved = "凭证由环境变量提供，环境变量优先生效。" if state["environment"] else "凭证已保存在本机，无需重复填写。"
+                summary.set(f"弹弹play官方来源 · {state['label']}\n{saved}\nAppId：{state['app_id']}")
+            else:
+                summary.set("弹弹play官方来源 · " + state["label"] + "\n" +
+                            (state["error"] or "首次使用请填写凭证；保存后会自动记住。"))
+        show_summary(current)
+        wrapped_label(body, textvariable=summary)
+        wrapped_label(body, text="启用后会自动查询官方弹幕，日常使用无需打开此窗口。可在这里停用来源、检查连接或修改凭证。")
+        app_id = tk.StringVar(value=current["app_id"])
         secret = tk.StringVar()
-        enabled = tk.BooleanVar(value=bool(current.get("enabled")))
-        for label, variable, mask in (("AppId", app_id, ""), ("AppSecret", secret, "●")):
-            ttk.Label(body, text=label).pack(anchor="w", pady=(10, 2))
-            entry = ttk.Entry(body, textvariable=variable, show=mask)
-            entry.pack(fill="x")
-        wrapped_label(body, text="AppSecret 留空会沿用本机已保存的密钥。新密钥由你从开发者中心复制后粘贴；本机使用 Windows 账号加密保存。")
+        enabled = tk.BooleanVar(value=current["enabled"])
         ttk.Checkbutton(body, text="启用官方弹幕来源", variable=enabled).pack(anchor="w", pady=8)
-        note = tk.StringVar(value="已保存密钥，可验证连接。" if current.get("protected_secret") else "填写凭证后点击“保存并验证”。")
+        editor_slot = ttk.Frame(body)
+        editor_slot.pack(fill="x")
+        editor = ttk.Frame(editor_slot)
+        for label, variable, mask in (("AppId", app_id, ""), ("新 AppSecret（已有密钥时留空沿用）", secret, "●")):
+            ttk.Label(editor, text=label).pack(anchor="w", pady=(10, 2))
+            entry = ttk.Entry(editor, textvariable=variable, show=mask)
+            entry.pack(fill="x")
+        wrapped_label(editor, text="已保存的密钥不回显。只有更换密钥时才填写；更换 AppId 必须同时提供对应密钥。")
+        ttk.Button(editor, text="打开开发者中心", command=lambda: webbrowser.open("https://dev.dandanplay.com/Center")).pack(anchor="w", pady=6)
+        def edit_credentials():
+            editor.pack(fill="x")
+            edit_button.pack_forget()
+        edit_button = ttk.Button(body, text="修改凭证…", command=edit_credentials)
+        if current["configured"]:
+            edit_button.pack(anchor="w", pady=6)
+        else:
+            editor.pack(fill="x")
+        note = tk.StringVar(value="已保存密钥，不需要重新输入；可直接关闭并识别影片。" if current["configured"]
+                            else "填写凭证后点击“保存并验证”。")
         wrapped_label(body, textvariable=note)
-        ttk.Button(body, text="打开开发者中心", command=lambda: webbrowser.open("https://dev.dandanplay.com/Center")).pack(anchor="w", pady=6)
         def save():
             if self.busy:
                 return
@@ -3231,6 +3271,9 @@ class App:
             def done(count):
                 if win.winfo_exists():
                     note.set("官方来源已停用。" if count is None else f"官方接口验证成功，返回 {count} 部作品。重新识别影片即可使用。")
+                    editor.pack_forget()
+                    if not edit_button.winfo_manager():
+                        edit_button.pack(anchor="w", pady=6)
                     save_button.configure(state="normal")
                 self.status.set("弹弹play官方接口已验证，可重新识别影片。" if count is not None else "弹弹play官方来源已停用。")
             def safe_work():
@@ -3239,6 +3282,9 @@ class App:
                 except (ToolError, OSError, ValueError) as exc:
                     return (False, str(exc))
             def show(result):
+                state = self.refresh_dandan_status()
+                if win.winfo_exists():
+                    show_summary(state)
                 if result[0]:
                     done(result[1])
                 elif win.winfo_exists():

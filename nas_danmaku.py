@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.8.3"
+VERSION = "2.8.4"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -1111,7 +1111,8 @@ NAS 写回失败会保留本机成品和待写回记录，重启后可恢复；�
 查询结果陆续显示；已有字幕和弹幕后，可点“使用已取得结果合成”结束等待。
 “停止等待”保留已有结果并解除界面等待，尚在连接的请求会在完成或超时后退出；合成与写回不支持中途取消。
 进度条表示当前步骤；切换步骤时会归零。没有可用总量时只显示等待/接收量和耗时。
-底部显示原始条数、最终条数和分类过滤数量；窗口内容支持滚动，操作区固定在底部。
+主窗口左侧选择影片、字幕和来源，右侧常驻弹幕状态及运行日志，无需滚动整页找日志。
+底部固定显示操作按钮、进度和过滤统计；设置窗口内容仍可滚动，日志有自己的滚动条。
 双击 .py 或运行 python nas_danmaku.py；也可把影片路径作为第一个参数传入。
 """
 
@@ -2652,6 +2653,27 @@ def wrapped_label(parent, **kwargs):
     parent.bind("<Configure>", lambda event: label.configure(wraplength=max(180, event.width - 24)), add="+")
     return label
 
+
+def main_window_layout(window):
+    """Keep the form, log and actions on screen without an outer page scrollbar."""
+    width = min(1280, max(640, window.winfo_screenwidth() - 80))
+    height = min(920, max(480, window.winfo_screenheight() - 100))
+    window.geometry(f"{width}x{height}")
+    window.minsize(min(width, 1100), min(height, 760))
+    footer = ttk.Frame(window, padding=(12, 6))
+    footer.pack(side="bottom", fill="x")
+    content = ttk.Frame(window)
+    content.pack(fill="both", expand=True)
+    content.columnconfigure(0, weight=3)
+    content.columnconfigure(1, weight=1, minsize=250)
+    content.rowconfigure(0, weight=1)
+    form = ttk.Frame(content, padding=(12, 8))
+    form.grid(row=0, column=0, sticky="nsew")
+    sidebar = ttk.Frame(content)
+    sidebar.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=8)
+    return form, footer, sidebar
+
+
 def elapsed_text(seconds):
     seconds = max(0, int(seconds))
     return f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
@@ -3097,14 +3119,14 @@ class App:
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", 17, "bold"))
         style.configure("TLabel", font=("Microsoft YaHei UI", 10))
         style.configure("TButton", padding=(8, 4))
-        p, footer = scrollable_window(root, 900, 780)
+        p, footer, sidebar = main_window_layout(root)
         head = ttk.Frame(p)
         head.pack(fill="x")
         ttk.Label(head, text="字幕＋弹幕", style="Title.TLabel").pack(side="left")
         ttk.Button(head, text="使用说明", command=self.help).pack(side="right")
         ttk.Button(head, text="网页找字幕", command=self.subtitle_sites).pack(side="right", padx=6)
         ttk.Button(head, textvariable=self.dandan_summary, command=self.open_dandan_settings).pack(side="right", padx=6)
-        ttk.Label(p, text="选择一部电影，找到台词和弹幕，合成一条字幕放回原目录。", foreground="#606975").pack(anchor="w", pady=(4, 10))
+        ttk.Label(p, text="选择影片 → 查找字幕和弹幕 → 核对后合成", foreground="#606975").pack(anchor="w", pady=(2, 6))
         row = ttk.Frame(p)
         row.pack(fill="x")
         self.path_entry = ttk.Entry(row, textvariable=self.path)
@@ -3115,23 +3137,23 @@ class App:
         self.scan_button = ttk.Button(row, text="识别", command=self.scan)
         self.scan_button.pack(side="left", padx=(6, 0))
         row = ttk.Frame(p)
-        row.pack(fill="x", pady=10)
+        row.pack(fill="x", pady=6)
         ttk.Label(row, text="识别片名", width=10).pack(side="left")
         self.title_entry = ttk.Entry(row, textvariable=self.title)
         self.title_entry.pack(side="left", fill="x", expand=True)
         self.retry_button = ttk.Button(row, text="按此片名重查", command=lambda: self.scan(override=True))
         self.retry_button.pack(side="left", padx=(8, 0))
-        ttk.Label(p, textvariable=self.identity_text, foreground="#606975", wraplength=790).pack(anchor="w", pady=(0, 8))
-        box = ttk.LabelFrame(p, text="找到的原台词字幕", padding=10)
-        box.pack(fill="x", pady=5)
+        ttk.Label(p, textvariable=self.identity_text, foreground="#606975", wraplength=790).pack(anchor="w", pady=(0, 4))
+        box = ttk.LabelFrame(p, text="找到的原台词字幕", padding=6)
+        box.pack(fill="x", pady=4)
         self.sub_box = ttk.Combobox(box, state="readonly", textvariable=self.subtitle)
         self.sub_box.pack(side="left", fill="x", expand=True)
         self.manual_sub = ttk.Button(box, text="补选字幕…", command=self.pick_subtitle)
         self.manual_sub.pack(side="left", padx=(8, 0))
         self.embedded_button = ttk.Button(box, text="使用内封", command=self.use_embedded)
         self.embedded_button.pack(side="left", padx=(6, 0))
-        box = ttk.LabelFrame(p, text="找到的电影弹幕", padding=10)
-        box.pack(fill="x", pady=5)
+        box = ttk.LabelFrame(p, text="找到的电影弹幕", padding=6)
+        box.pack(fill="x", pady=4)
         row = ttk.Frame(box)
         row.pack(fill="x")
         self.movie_box = ttk.Combobox(row, state="readonly", textvariable=self.movie)
@@ -3147,10 +3169,12 @@ class App:
         self.platform_box.bind("<<ComboboxSelected>>", self.change_platform)
         self.retry_sources_button = ttk.Button(row, text="重查来源", command=self.retry_sources)
         self.retry_sources_button.pack(side="left", padx=(8, 0))
-        ttk.Label(box, textvariable=self.source_status, wraplength=760, foreground="#606975").pack(anchor="w", pady=(6, 0))
-        ttk.Label(box, textvariable=self.dm_text, wraplength=760, foreground="#31566e").pack(anchor="w", pady=(8, 0))
+        details = ttk.LabelFrame(sidebar, text="弹幕状态", padding=8)
+        details.pack(fill="x", pady=(0, 8))
+        wrapped_label(details, textvariable=self.source_status, wraplength=280, foreground="#606975")
+        wrapped_label(details, textvariable=self.dm_text, wraplength=280, foreground="#31566e")
         row = ttk.Frame(p)
-        row.pack(fill="x", pady=10)
+        row.pack(fill="x", pady=6)
         ttk.Label(row, text="弹幕偏移（秒）").pack(side="left")
         ttk.Entry(row, textvariable=self.offset, width=8).pack(side="left", padx=6)
         ttk.Label(row, text="正数延后，负数提前", foreground="#606975").pack(side="left")
@@ -3180,9 +3204,9 @@ class App:
         wrapped_label(footer, textvariable=self.result_summary)
         wrapped_label(footer, textvariable=self.status)
         wrapped_label(footer, textvariable=self.progress_text, foreground="#606975")
-        log_frame = ttk.Frame(p)
-        log_frame.pack(fill="both", expand=True, pady=(6, 0))
-        self.log_box = tk.Text(log_frame, height=4, wrap="word", state="disabled", font=("Microsoft YaHei UI", 9))
+        log_frame = ttk.LabelFrame(sidebar, text="运行日志", padding=8)
+        log_frame.pack(fill="both", expand=True)
+        self.log_box = tk.Text(log_frame, width=32, height=6, wrap="word", state="disabled", font=("Microsoft YaHei UI", 9))
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_box.yview)
         self.log_box.configure(yscrollcommand=scrollbar.set)
         self.log_box.pack(side="left", fill="both", expand=True)

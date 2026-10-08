@@ -257,6 +257,54 @@ class UXGuiTests(UXFixture, unittest.TestCase):
         self.assertIs(footer.master, top)
         top.destroy()
 
+    def test_main_form_log_and_actions_fit_without_page_scrolling(self):
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+
+        for screen, resize in (((1920, 1080), None), ((1366, 768), None), ((1920, 1080), '1100x760')):
+            with self.subTest(screen=screen, resize=resize):
+                self.root.destroy()
+                self.root = tk.Tk()
+                self.root.withdraw()
+                with patch.object(self.root, 'winfo_screenwidth', return_value=screen[0]), \
+                        patch.object(self.root, 'winfo_screenheight', return_value=screen[1]):
+                    self.app = d.App(self.root)
+                if resize:
+                    self.root.geometry(resize)
+                self.app.identity_text.set('NFO识别 · 年份：1998 · 片长：约 102.9 分钟')
+                self.app.source_status.set('弹弹play开放弹幕网络 · 27,448 条；哔哩哔哩 · 15,880 条；'
+                    '腾讯视频 · 未取得；爱奇艺 · 未取得；优酷 · 未取得；芒果 TV · 未取得；未取得的原因见下方日志。')
+                self.app.dm_text.set('已获取 27,448 条 · 弹弹play开放弹幕网络 · 官方＋关联弹幕\n'
+                    '原始预览（合成时过滤）：这是一条用于检查布局的弹幕 / 第二条用于检查布局的弹幕')
+                self.app.output_text.set('输出到：Z:/电影/楚门的世界.The.Truman.Show.1998.Repack.EUR.'
+                    'BDRip.1080p.x265.10bit.DDP5.1.2Audio-DGB/弹幕版-楚门的世界.The.Truman.Show.1998.'
+                    'Repack.EUR.BDRip.1080p.x265.10bit.DDP5.1.2Audio-DGB.ass')
+                self.app.result_summary.set('原始 27,448 条 → 最终 12,340 条 · 过滤 15,108 条')
+                self.app.status.set('已找到字幕和弹幕，请核对后确认合成。')
+                # Withdrawn roots need an explicit Configure event to settle geometry.
+                self.root.update_idletasks()
+                self.root.event_generate('<Configure>')
+                self.root.update_idletasks()
+                if resize:
+                    self.assertEqual((self.root.winfo_width(), self.root.winfo_height()), (1100, 760))
+                widgets = list(descendants(self.root))
+                self.assertFalse(any(isinstance(w, tk.Canvas) for w in widgets))
+                self.assertGreaterEqual(self.app.log_box.winfo_height(), 120)
+                self.assertLessEqual(self.root.winfo_reqheight(), self.root.winfo_height())
+                for widget in widgets:
+                    with self.subTest(widget=str(widget)):
+                        self.assertGreater(widget.winfo_height(), 1)
+                        self.assertGreater(widget.winfo_width(), 1)
+                        self.assertGreaterEqual(widget.winfo_x(), 0)
+                        self.assertGreaterEqual(widget.winfo_y(), 0)
+                        self.assertLessEqual(widget.winfo_y() + widget.winfo_height(), widget.master.winfo_height())
+                        self.assertLessEqual(widget.winfo_x() + widget.winfo_width(), widget.master.winfo_width())
+                        if isinstance(widget, (d.ttk.Label, d.ttk.Button)):
+                            self.assertGreaterEqual(widget.winfo_height(), widget.winfo_reqheight())
+                            self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth())
+
     def test_dandan_dialog_prefills_disabled_credentials_and_toggles_secret_visibility(self):
         d.save_local_json('dandanplay.local.json', dict(version=1, app_id='testapp', enabled=False, protected_secret='encrypted'))
         with patch.object(d, 'dandan_protect', return_value='stored-test-secret') as decrypt:

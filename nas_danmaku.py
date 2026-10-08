@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.10.1"
+VERSION = "2.10.2"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -1077,6 +1077,7 @@ NAS 写回失败会保留本机成品和待写回记录，重启后可恢复；�
 
 弹幕：按片名通过 360 影视查找电影平台链接，B 站优先直连合并 XML 与分段，其他平台向公开弹幕库按需请求；不需要你填密钥。
 选中电影后，自动核实其已找到链接的各个平台，显示来源和实际取得的原始弹幕条数。
+电影搜索会排除标题明确标注的鉴赏、解说和预告片，避免把它们当作电影正片弹幕。
 “来源”只列出已取得并缓存的弹幕，切换直接用本机缓存。未取得的来源单独标注，详细原因见日志。
 弹幕盒子历史归档也会按片名查询，成功后进入“来源”；不同版本分别显示名称和实际条数，不自动混合。
 输入简称时，还会用电影搜索识别出的完整片名和年份匹配归档。
@@ -1998,6 +1999,12 @@ def search_movies(title, year=""):
                 continue
             found = html.unescape(re.sub(r"<[^>]+>", "", row.get("titleTxt") or row.get("title", "")))
             a, b = normalize_title(found), normalize_title(query)
+            # Some providers label reviews/trailers as movies and give them the
+            # feature's exact alias. Do not let that alias bypass the title label.
+            extra = r"(?:(?:电影|影片|影视)(?:鉴赏|赏析|解说|影评|预告片?)|影评|预告片|幕后花絮|剧情解析)"
+            if a != b and (re.match(extra + r"[\s:：·\-《〈【（(]", found) or
+                           re.search(r"[\s:：·\-》〉】）)]" + extra + r"$", found)):
+                continue
             aliases = [normalize_title(x) for x in re.split(r"[/|;]", row.get("titlealias", "")) if x]
             similarity = max([difflib.SequenceMatcher(None, a, b).ratio()] + [difflib.SequenceMatcher(None, alias, b).ratio() for alias in aliases])
             if similarity < .58:

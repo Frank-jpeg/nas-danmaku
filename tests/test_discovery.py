@@ -136,6 +136,36 @@ class AutoTests(unittest.TestCase):
         with self.assertRaises(d.ToolError):
             d.canonical_platform_url('https://qq.com.evil.test/x')
 
+    def test_movie_search_excludes_commentary_and_trailers_even_with_matching_aliases(self):
+        titles = ['电影鉴赏《寄生虫》', '电影解说：寄生虫', '寄生虫：预告片',
+                  '寄生虫', '寄生虫（黑白版）']
+        rows = [dict(cat_id='1', titleTxt=title, titlealias='寄生虫', year='2019',
+                     playlinks={'youku': 'https://v.youku.com/v_show/id_test.html'}) for title in titles]
+        with patch.object(d, 'web_json', return_value={'data': {'longData': {'rows': rows}}}):
+            found = d.search_movies('寄生虫', '2019')
+        self.assertEqual([row['title'] for row in found], ['寄生虫', '寄生虫（黑白版）'])
+        for title in ('预告犯', '影评人', '电影解说'):
+            with self.subTest(title=title), patch.object(d, 'web_json', return_value={
+                    'data': {'longData': {'rows': [dict(rows[0], titleTxt=title, titlealias='')]}}}):
+                self.assertEqual(d.search_movies(title)[0]['title'], title)
+
+    def test_commentary_does_not_replace_ambiguous_official_movie_candidates(self):
+        official = [dict(title='寄生虫', official_title='寄生虫', year=year, duration='',
+                         links={'dandanplay': f'https://api.dandanplay.net/api/v2/comment/{episode}'})
+                    for year, episode in [('2019', 123), ('2016', 456)]]
+        reply = {'data': {'longData': {'rows': [dict(cat_id='1', titleTxt='电影鉴赏《寄生虫》',
+                 titlealias='寄生虫', year='2020', playlinks={'youku': 'https://v.youku.com/v_show/id_test.html'})]}}}
+        with patch.object(d, 'dandan_config', return_value={'enabled': True}), \
+                patch.object(d, 'dandan_search', return_value=official), \
+                patch.object(d, 'web_json', return_value=reply), \
+                patch.object(d, 'discover_subtitles', return_value=([], [])), \
+                patch.object(d, 'fetch_public_danmaku') as fetch:
+            result = d.scan_movie(None, '寄生虫')
+        fetch.assert_not_called()
+        self.assertEqual([row['year'] for row in result.movies], ['2019', '2016'])
+        self.assertTrue(all(row.get('official_confirm') for row in result.movies))
+        self.assertFalse(result.comments)
+
     def test_bilingual_title_retries_chinese_name(self):
         from urllib.parse import parse_qs, urlsplit
         empty = {'data': {'longData': None}}

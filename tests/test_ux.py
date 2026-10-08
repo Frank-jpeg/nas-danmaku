@@ -21,7 +21,8 @@ class UXFixture:
         self.addCleanup(self.tmp.cleanup)
         self.folder = Path(self.tmp.name)
         for mock in (patch.dict(os.environ, {'LOCALAPPDATA': self.tmp.name}),
-                     patch.object(d, 'local_backup_folder', return_value=self.folder / 'backups')):
+                     patch.object(d, 'local_backup_folder', return_value=self.folder / 'backups'),
+                     patch.object(d, 'search_danmubox', return_value=[])):
             mock.start()
             self.addCleanup(mock.stop)
 
@@ -309,6 +310,50 @@ class UXGuiTests(UXFixture, unittest.TestCase):
         self.assertEqual(str(self.app.generate_button['state']), 'normal')
         self.assertIn('弹幕版-film.ass', self.app.output_text.get())
 
+    def test_archive_dropdown_switches_offline_and_keeps_selection_when_attaching_video(self):
+        entries = [dict(name='电影 [新上架版]', repo='repo007', file='04/' + 'a' * 32 + '.7z', size=1024),
+                   dict(name='电影 [旧版]', repo='repo007', file='04/' + 'b' * 32 + '.7z', size=512)]
+        movie = dict(MOVIE, year='2020', danmubox=entries)
+        subtitle = d.SubtitleChoice('台词', 'online', doc=d.parse_srt('1\n00:00:01,000 --> 00:00:03,000\n台词'))
+        result = d.ScanResult(None, dict(title='电影', year='2020', source='手动片名'), {}, (),
+                             movies=[movie], subtitles=[subtitle], workspace=self.folder)
+        def fetched(movie, progress, platform):
+            name = next((row['name'] for row in entries if d.danmubox_source_id(row) == platform), '原平台')
+            count = 2 if name == '电影 [旧版]' else 1
+            return [d.Comment(i + 1, name + str(i)) for i in range(count)], name, 'url'
+        with patch.object(d, 'fetch_public_danmaku', side_effect=fetched):
+            options = d.discover_danmaku_sources(result, movie)
+        d.select_danmaku_source(result, movie)
+        self.app.title.set('电影 2020')
+        with patch.object(d, 'scan_movie', return_value=result):
+            self.app.retry_button.invoke()
+            self.wait()
+        labels = self.app.platform_box['values']
+        self.assertEqual(len(labels), 3)
+        self.assertIn('哔哩哔哩', labels[0])
+        self.assertIn('弹幕盒子（历史归档） · 2 条 · 电影 [旧版]', labels[2])
+        self.assertIn('2/2 个归档可选', self.app.source_status.get())
+        with patch.object(d, 'web_bytes', side_effect=AssertionError('切换与合成不应联网')):
+            for index in (2, 0, 1, 2):
+                self.app.platform_box.current(index)
+                self.app.change_platform()
+                self.assertEqual(self.app.result.selected_platform, options[index].platform)
+                self.assertIs(self.app.result.comments, options[index].comments)
+            video = self.folder / 'film.mkv'
+            video.write_bytes(b'video')
+            with patch.object(d, 'inspect_video', return_value={'format': {'duration': 60}}), \
+                    patch.object(d.filedialog, 'askopenfilename', return_value=str(video)):
+                self.app.browse()
+                self.wait()
+            self.assertEqual(self.app.platform_box.current(), 2)
+            self.assertEqual(self.app.result.video, video.resolve())
+            self.app.generate()
+            self.wait()
+        self.assertTrue(self.app.last_output['saved'])
+        output = Path(self.app.last_output['output']).read_text(encoding='utf-8')
+        self.assertIn('台词', output)
+        self.assertIn('旧版', output)
+
     def test_empty_title_search_keeps_current_result_and_does_not_open_picker(self):
         result = self.app.result = d.ScanResult(None, {}, {}, ())
         self.app.title.set('  ')
@@ -348,8 +393,9 @@ class UXGuiTests(UXFixture, unittest.TestCase):
                     self.root.geometry(resize)
                 self.app.identity_text.set('NFO识别 · 年份：1998 · 片长：约 102.9 分钟')
                 self.app.source_status.set('弹弹play开放弹幕网络 · 27,448 条；哔哩哔哩 · 15,880 条；'
-                    '腾讯视频 · 未取得；爱奇艺 · 未取得；优酷 · 未取得；芒果 TV · 未取得；未取得的原因见下方日志。')
-                self.app.dm_text.set('已获取 27,448 条 · 弹弹play开放弹幕网络 · 官方＋关联弹幕\n'
+                    '腾讯视频 · 未取得；爱奇艺 · 未取得；优酷 · 未取得；芒果 TV · 未取得；'
+                    '弹幕盒子：8/8 个归档可选，最多 40,721 条；未取得的原因见下方日志。')
+                self.app.dm_text.set('已获取 40,721 条 · 弹幕盒子（历史归档） · 肖申克的救赎 [×5] [新上架版] · 请核对版本和时间轴\n'
                     '原始预览（合成时过滤）：这是一条用于检查布局的弹幕 / 第二条用于检查布局的弹幕')
                 self.app.output_text.set('输出到：Z:/电影/楚门的世界.The.Truman.Show.1998.Repack.EUR.'
                     'BDRip.1080p.x265.10bit.DDP5.1.2Audio-DGB/弹幕版-楚门的世界.The.Truman.Show.1998.'

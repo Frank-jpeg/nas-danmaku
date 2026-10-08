@@ -48,7 +48,7 @@ class AutoTests(unittest.TestCase):
         online = patch.object(d, 'online_subtitles', return_value=[])
         subhd = patch.object(d, 'subhd_subtitles', return_value=[])
         subtitlecat = patch.object(d, 'subtitlecat_subtitles', return_value=[])
-        for fixture in (cache, titles, online, subhd, subtitlecat):
+        for fixture in (cache, titles, online, subhd, subtitlecat, patch.object(d, 'search_danmubox', return_value=[])):
             fixture.start()
             self.addCleanup(fixture.stop)
         # 保留真实在线解析函数，单独测试时使用。

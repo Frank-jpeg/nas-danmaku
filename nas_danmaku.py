@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.9.1"
+VERSION = "2.10.0"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -1042,6 +1042,7 @@ import queue
 import threading
 LOCAL_STATE_LOCK = threading.Lock()
 DANDAN_REQUEST_LOCK = threading.Lock()
+DANMUBOX_LOCK = threading.Lock()
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -1051,7 +1052,7 @@ SHOOTER_API = "https://www.shooter.cn/api/subapi.php"
 THUNDER_SUBTITLE_API = "https://api-shoulei-ssl.xunlei.com/oracle/subtitle"
 KAN_SEARCH = "https://api.so.360kan.com/index"
 PLATFORMS = {"qq": "腾讯视频", "qiyi": "爱奇艺", "bilibili1": "哔哩哔哩", "youku": "优酷", "imgo": "芒果TV"}
-PLATFORM_NAMES = dict(PLATFORMS, dandanplay="弹弹play开放弹幕网络")
+PLATFORM_NAMES = dict(PLATFORMS, dandanplay="弹弹play开放弹幕网络", danmubox="弹幕盒子（历史归档）")
 HOSTS = ("qq.com", "iqiyi.com", "bilibili.com", "youku.com", "mgtv.com")
 HELP = "字幕弹幕一键合成 v" + VERSION + """（单文件）
 
@@ -1077,6 +1078,8 @@ NAS 写回失败会保留本机成品和待写回记录，重启后可恢复；�
 弹幕：按片名通过 360 影视查找电影平台链接，B 站优先直连合并 XML 与分段，其他平台向公开弹幕库按需请求；不需要你填密钥。
 选中电影后，自动核实其已找到链接的各个平台，显示来源和实际取得的原始弹幕条数。
 “来源”只列出已取得并缓存的弹幕，切换直接用本机缓存。未取得的来源单独标注，详细原因见日志。
+弹幕盒子历史归档也会按片名查询，成功后进入“来源”；不同版本分别显示名称和实际条数，不自动混合。
+目录缓存 24 小时；7z 归档需要本机已有 7-Zip。归档是历史保存量，请核对电影版本和时间轴。
 “重查来源”重试未取得、未完成及部分取得的项目，保留完整成功来源；补取失败仍保留原数据。
 B 站直连失败后使用第三方缓存，会标注“第三方缓存，可重试”；条数仅代表本次取得量，完整性未验证。
 公共源插入的“有多少条弹幕正在赶来”等系统提示不计入评论，也不参与合成。
@@ -1770,7 +1773,7 @@ def safe_archive_member(name):
     return bool(name) and not name.startswith(("/", "\\", "-", "@")) and ":" not in name and ".." not in parts
 
 
-def subtitle_archive_members(raw):
+def subtitle_archive_members(raw, *, extensions=(".ass", ".srt")):
     """仅返回文字字幕字节；压缩包里的路径不落地。"""
     if raw.startswith(b"PK"):
         try:
@@ -1779,7 +1782,7 @@ def subtitle_archive_members(raw):
                 if len(items) > 100 or sum(i.file_size for i in items) > MAX_BYTES:
                     raise ToolError("字幕压缩包解压总量或文件数超限。")
                 for item in items:
-                    if safe_archive_member(item.filename) and not item.flag_bits & 1 and Path(item.filename).suffix.lower() in {".ass", ".srt"}:
+                    if safe_archive_member(item.filename) and not item.flag_bits & 1 and Path(item.filename).suffix.lower() in extensions:
                         yield item.filename, archive.read(item)
         except (zipfile.BadZipFile, RuntimeError, NotImplementedError) as exc:
             raise ToolError("无法读取字幕 ZIP：" + str(exc)) from exc
@@ -1815,7 +1818,7 @@ def subtitle_archive_members(raw):
             raise ToolError("字幕压缩包解压总量或文件数超限。")
         for item in items:
             name = item.get("Path", "")
-            if not safe_archive_member(name) or item.get("Encrypted") == "+" or Path(name).suffix.lower() not in {".srt", ".ass"}:
+            if not safe_archive_member(name) or item.get("Encrypted") == "+" or Path(name).suffix.lower() not in extensions:
                 continue
             yield name, run(["x", "-so", "-bd", "-bb0", "-bsp0", "-spd", str(archive), name])
 
@@ -2009,6 +2012,208 @@ def search_movies(title, year=""):
         if results:
             break
     return sorted(results, key=lambda r: -r["score"])[:8]
+
+
+def decode_danmubox_index(raw):
+    """Decode the public site's AES-256-ECB catalog using Windows CNG.
+
+    The public viewer's Utf8.parse takes characters 12:44 of its published key.
+    This format key is shared by all visitors; it is not an account credential.
+    """
+    if os.name != "nt":
+        raise ToolError("弹幕盒子目录解码目前需要 Windows。")
+    import ctypes
+    from ctypes import wintypes
+    if len(raw) > 2 * 1024 * 1024:
+        raise ToolError("弹幕盒子目录大小超限。")
+    try:
+        encrypted = base64.b64decode(raw.strip(), validate=True)
+    except ValueError:
+        raise ToolError("弹幕盒子目录编码无效。") from None
+    if not encrypted or len(encrypted) % 16:
+        raise ToolError("弹幕盒子目录长度无效。")
+    key_bytes = b"jQoRm5OREM7S3qy3ZBgFV8EqPAP6jsZJ"
+    cng = ctypes.WinDLL("bcrypt")
+    pointer, ulong = ctypes.c_void_p, wintypes.ULONG
+    signatures = {
+        "BCryptOpenAlgorithmProvider": [ctypes.POINTER(pointer), wintypes.LPCWSTR, wintypes.LPCWSTR, ulong],
+        "BCryptSetProperty": [pointer, wintypes.LPCWSTR, pointer, ulong, ulong],
+        "BCryptGenerateSymmetricKey": [pointer, ctypes.POINTER(pointer), pointer, ulong, pointer, ulong, ulong],
+        "BCryptDecrypt": [pointer, pointer, ulong, pointer, pointer, ulong, pointer, ulong, ctypes.POINTER(ulong), ulong],
+        "BCryptDestroyKey": [pointer], "BCryptCloseAlgorithmProvider": [pointer, ulong],
+    }
+    for name, signature in signatures.items():
+        getattr(cng, name).argtypes = signature
+        getattr(cng, name).restype = wintypes.LONG
+    def check(code):
+        if code:
+            raise ToolError("弹幕盒子目录解码失败，目录格式可能已更新。")
+    algorithm, key = pointer(), pointer()
+    try:
+        check(cng.BCryptOpenAlgorithmProvider(ctypes.byref(algorithm), "AES", None, 0))
+        mode = ctypes.create_unicode_buffer("ChainingModeECB")
+        check(cng.BCryptSetProperty(algorithm, "ChainingMode", mode, ctypes.sizeof(mode), 0))
+        secret = ctypes.create_string_buffer(key_bytes)
+        check(cng.BCryptGenerateSymmetricKey(algorithm, ctypes.byref(key), None, 0, secret, len(key_bytes), 0))
+        incoming, outgoing = ctypes.create_string_buffer(encrypted), ctypes.create_string_buffer(len(encrypted))
+        length = ulong()
+        check(cng.BCryptDecrypt(key, incoming, len(encrypted), None, None, 0, outgoing, len(encrypted), ctypes.byref(length), 1))
+        return outgoing.raw[:length.value].decode("utf-8")
+    except UnicodeError:
+        raise ToolError("弹幕盒子目录文本无效。") from None
+    finally:
+        if key:
+            cng.BCryptDestroyKey(key)
+        if algorithm:
+            cng.BCryptCloseAlgorithmProvider(algorithm, 0)
+
+
+def valid_danmubox_entry(entry):
+    return (isinstance(entry, dict) and isinstance(entry.get("name"), str) and 0 < len(entry["name"]) <= 500
+            and isinstance(entry.get("repo"), str) and re.fullmatch(r"repo\d{3}", entry["repo"])
+            and isinstance(entry.get("file"), str) and re.fullmatch(r"\d{2}/[a-f0-9]{32}\.7z", entry["file"])
+            and isinstance(entry.get("size"), int) and 0 < entry["size"] <= MAX_BYTES)
+
+
+def parse_danmubox_index(text, repo):
+    entries = []
+    for row in text.split(";"):
+        fields = row.split(",")
+        if len(fields) != 4 or not fields[1].isdigit():
+            continue
+        entry = dict(name=fields[0], size=int(fields[1]), repo=repo, file=fields[3] + ".7z")
+        if valid_danmubox_entry(entry):
+            entries.append(entry)
+    if not entries:
+        raise ToolError("弹幕盒子目录中没有可识别的归档记录。")
+    return entries
+
+
+def danmubox_catalog(progress=None):
+    cache = filter_rules_path().parent / "cache" / "danmubox" / "catalog.json"
+    with DANMUBOX_LOCK:
+        previous = []
+        try:
+            previous = json.loads(read_text(cache))
+            if not isinstance(previous, list) or not previous or not all(valid_danmubox_entry(row) for row in previous):
+                previous = []
+            if previous and 0 <= time.time() - cache.stat().st_mtime < 24 * 3600:
+                return previous
+        except (OSError, ToolError, ValueError):
+            pass
+        def request(name):
+            for host in ("https://dmrepository.github.io/list/", "https://dmrepository-list.vercel.app/"):
+                try:
+                    return web_bytes(host + name, timeout=15)
+                except ToolError:
+                    continue
+            raise ToolError("弹幕盒子目录暂时无法连接。")
+        try:
+            report(progress, "查询弹幕盒子历史归档目录")
+            repositories = request("index").decode("utf-8").strip().split(",")
+            if not 1 <= len(repositories) <= 32 or not all(re.fullmatch(r"repo\d{3}", repo) for repo in repositories):
+                raise ToolError("弹幕盒子目录列表格式无效。")
+            def fetch(repo):
+                return parse_danmubox_index(decode_danmubox_index(request(repo)), repo)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                entries = [entry for batch in pool.map(fetch, repositories) for entry in batch]
+        except (ToolError, ValueError) as exc:
+            if previous:
+                report(progress, "弹幕盒子目录刷新失败，继续使用本机旧目录")
+                return previous
+            if not isinstance(exc, ToolError):
+                raise ToolError("弹幕盒子目录格式无效，暂时无法查询历史归档。") from None
+            raise
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache.with_suffix("." + uuid.uuid4().hex + ".tmp")
+        try:
+            temporary.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, cache)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return entries
+
+
+def danmubox_matches(name, title, year=""):
+    # Bracketed labels describe archive editions; a sequel number is not an edition.
+    cleaned = re.sub(r"\[[^\]]*\]|【[^】]*】|\([^)]*\)|（[^）]*）", " ", name)
+    found = normalize_title(cleaned)
+    for query in subtitle_queries(None, {"title": title}):
+        query = normalize_title(query)
+        if not query:
+            continue
+        start = found.find(query)
+        if start < 0:
+            continue
+        before, after = found[:start], found[start + len(query):]
+        # A Chinese/English alias may border the other script, but not another
+        # word in the same script or a sequel number.
+        prefix = r"[a-z0-9]$" if re.match(r"[a-z]", query) else r"[\u4e00-\u9fff0-9]$"
+        suffix = r"[a-z0-9]" if re.search(r"[a-z]$", query) else r"[\u4e00-\u9fff0-9]"
+        if before and re.search(prefix, before):
+            continue
+        if after and re.match(suffix, after):
+            if not (year and after == year):
+                continue
+        # Exclude the title itself so numeric titles such as 2012 are not years.
+        without_title = re.sub(r"[\W_]*".join(map(re.escape, query)), "", name, count=1, flags=re.I)
+        years = re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", without_title)
+        if year and years and year not in years:
+            continue
+        return True
+    return False
+
+
+def search_danmubox(title, year="", progress=None):
+    rows = [row for row in danmubox_catalog(progress) if danmubox_matches(row["name"], title, year)]
+    unique = {(row["repo"], row["file"]): row for row in rows}
+    # Keep different archive editions separate; size only orders candidates, not counts.
+    return sorted(unique.values(), key=lambda row: (-row["size"], row["name"]))[:8]
+
+
+def danmubox_source_id(entry):
+    return "danmubox:" + entry["repo"] + "/" + entry["file"]
+
+
+def fetch_danmubox(entry, progress=None):
+    if not valid_danmubox_entry(entry):
+        raise ToolError("弹幕盒子归档地址无效。")
+    relative = entry["repo"] + "/" + entry["file"]
+    url = "https://cdn.jsdelivr.net/gh/dmrepository/" + relative
+    errors = []
+    for target in (url, "https://raw.githubusercontent.com/dmrepository/" + entry["repo"] + "/master/" + entry["file"]):
+        try:
+            raw = web_bytes(target, timeout=25, progress=progress, message="下载历史归档：" + entry["name"])
+            if not raw.startswith((b"7z\xbc\xaf\x27\x1c", b"PK")):
+                raise ToolError("弹幕盒子未返回有效压缩包。")
+            break
+        except ToolError as exc:
+            errors.append(str(exc))
+    else:
+        raise ToolError("弹幕盒子归档下载失败：" + "；".join(errors))
+    report(progress, "解包并核对历史弹幕：" + entry["name"])
+    try:
+        members = list(subtitle_archive_members(raw, extensions=(".xml", ".json")))
+    except ToolError as exc:
+        raise ToolError(str(exc).replace("字幕", "弹幕")) from None
+    if len(members) != 1:
+        raise ToolError("此归档含多份文件或没有 XML/JSON，请到弹幕盒子网页下载后分别补选。")
+    comments, _ = parse_comments(decode_subtitle(members[0][1]))
+    comments = [comment for comment in comments if not public_danmaku_notice(comment.text)]
+    if not comments:
+        raise ToolError("此归档没有可用弹幕。")
+    return comments, "弹幕盒子（历史归档） · " + entry["name"] + " · 请核对版本和时间轴", url
+
+
+def platform_name(platform):
+    return PLATFORM_NAMES.get(platform.split(":", 1)[0], platform)
+
+
+def movie_source_links(movie):
+    links = {key: movie["links"][key] for key in PLATFORM_NAMES if key in movie["links"]}
+    links.update({danmubox_source_id(entry): entry["repo"] + "/" + entry["file"]
+                  for entry in movie.get("danmubox", []) if valid_danmubox_entry(entry)})
+    return links
 
 
 def canonical_platform_url(url):
@@ -2211,7 +2416,12 @@ def fetch_bilibili_danmaku(url, progress=None):
 
 def fetch_public_danmaku(movie, progress, platform=None):
     errors = []
-    if platform is not None and (platform not in PLATFORM_NAMES or platform not in movie["links"]):
+    if platform is not None and platform.startswith("danmubox:"):
+        entry = next((row for row in movie.get("danmubox", []) if valid_danmubox_entry(row) and danmubox_source_id(row) == platform), None)
+        if entry is None:
+            raise ToolError("所选历史归档不属于当前电影，请重新查询。")
+        return fetch_danmubox(entry, progress)
+    if platform is not None and ((platform not in PLATFORMS and platform != "dandanplay") or platform not in movie["links"]):
         raise ToolError("当前电影没有所选平台的链接，请选择列表中的其他来源。")
     if platform == "dandanplay" or (platform is None and "dandanplay" in movie["links"]):
         url = movie["links"]["dandanplay"]
@@ -2273,6 +2483,7 @@ class DanmakuSource:
     url: str = ""
     cache_path: str = ""
     error: str = ""
+    edition: str = ""
 
     @property
     def available(self):
@@ -2285,21 +2496,27 @@ class DanmakuSource:
     @property
     def label(self):
         if not self.available:
-            return f"{PLATFORM_NAMES[self.platform]} · 未取得"
+            return f"{platform_name(self.platform)}" + (f" · {self.edition}" if self.edition else "") + " · 未取得"
         suffix = "（第三方缓存，可重试）" if self.partial and "第三方缓存" in self.source else "（部分取得，可重试）" if self.partial else ""
-        return f"{PLATFORM_NAMES[self.platform]} · {len(self.comments):,} 条" + suffix
+        return f"{platform_name(self.platform)} · {len(self.comments):,} 条" + (f" · {self.edition}" if self.edition else "") + suffix
 
 
 def movie_source_key(movie):
     # 标题/年份及实际链接一起隔离缓存，避免切换版本时串用弹幕。
     return (movie.get("title", ""), movie.get("year", ""),
-            tuple((key, movie["links"][key]) for key in PLATFORM_NAMES if key in movie["links"]), movie.get("official_shift", 0))
+            tuple(movie_source_links(movie).items()), movie.get("official_shift", 0))
 
 
 def source_summary(options):
     if options is None:
         return "来源尚未查询，选中电影后自动核实。"
-    return "；".join(option.label for option in options) or "没有受支持的平台链接。"
+    labels = [option.label for option in options if not option.platform.startswith("danmubox:")]
+    archives = [option for option in options if option.platform.startswith("danmubox:")]
+    if archives:
+        available = [row for row in archives if row.available]
+        labels.append(f"弹幕盒子：{len(available)}/{len(archives)} 个归档可选" +
+                      (f"，最多 {max(len(row.comments) for row in available):,} 条" if available else ""))
+    return "；".join(labels) or "没有受支持的平台链接。"
 
 
 def movie_choice_label(movie, catalog):
@@ -2321,24 +2538,26 @@ def discover_danmaku_sources(result, movie, progress=None, retry_failed=False, o
     if previous is not None and not retry_failed:
         return previous
     retained = {option.platform: option for option in previous or [] if option.available}
-    keys = [platform for platform in PLATFORM_NAMES if platform in movie["links"]]
+    keys = list(movie_source_links(movie))
     pending = [platform for platform in keys if platform not in retained or retained[platform].partial]
     if result.workspace is None:
         result.workspace = local_workspace()
     result.source_pending = list(pending)
     def fetch(platform):
+        edition = next((row["name"] for row in movie.get("danmubox", []) if valid_danmubox_entry(row) and danmubox_source_id(row) == platform), "")
         try:
             def detail(update):
                 message = update.message if isinstance(update, ProgressUpdate) else str(update)
                 if progress:
-                    progress(ProgressUpdate(f"{PLATFORM_NAMES[platform]}：{message}"))
+                    progress(ProgressUpdate(f"{platform_name(platform)}：{message}"))
             comments, source, url = fetch_public_danmaku(movie, detail, platform=platform)
             if not comments:
                 raise ToolError("该来源未返回可用弹幕。")
-            path = cached_comment_file(comments, result.workspace, f"danmaku-{platform}.json")
-            return DanmakuSource(platform, comments, source, url, str(path))
+            cache_name = "danmubox-" + hashlib.sha256(platform.encode()).hexdigest()[:16] if edition else platform
+            path = cached_comment_file(comments, result.workspace, f"danmaku-{cache_name}.json")
+            return DanmakuSource(platform, comments, source, url, str(path), edition=edition)
         except (ToolError, OSError, ValueError) as exc:
-            return DanmakuSource(platform, error=str(exc))
+            return DanmakuSource(platform, error=str(exc), edition=edition)
     def publish():
         result.source_catalog[key] = [retained[platform] for platform in keys if platform in retained]
         if on_update:
@@ -2472,12 +2691,27 @@ def scan_movie(video, override="", progress=lambda _: None, on_update=None):
         try:
             fallback = search_movies(identity["title"], identity["year"])
         except (ToolError, OSError) as exc:
-            if not official:
-                raise
             fallback = []
             notices.append("其他电影来源未取得：" + str(exc))
-        return ([movie for movie in official if not movie.get("official_confirm")] + fallback +
-                [movie for movie in official if movie.get("official_confirm")]), notices
+        movies = ([movie for movie in official if not movie.get("official_confirm")] + fallback +
+                  [movie for movie in official if movie.get("official_confirm")])
+        try:
+            archives = search_danmubox(identity["title"], identity["year"])
+        except (ToolError, OSError) as exc:
+            archives = []
+            notices.append("弹幕盒子历史目录未取得：" + str(exc))
+        else:
+            if not archives:
+                notices.append("弹幕盒子未找到匹配归档，可尝试其他片名，或从网页下载后补选。")
+        attached = False
+        for index, movie in enumerate(movies):
+            matches = [row for row in archives if danmubox_matches(row["name"], movie.get("official_title", movie["title"]), movie.get("year", ""))]
+            if matches:
+                movies[index] = dict(movie, danmubox=matches)
+                attached = True
+        if archives and not attached:
+            movies.append(dict(title=identity["title"], year=identity["year"], duration="", links={}, danmubox=archives))
+        return movies, notices
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         sub_future = pool.submit(discover_subtitles, video, meta, lambda _: None, identity, result.workspace)
         movie_future = pool.submit(find_movies)
@@ -2513,7 +2747,7 @@ def scan_movie(video, override="", progress=lambda _: None, on_update=None):
                 select_danmaku_source(result, chosen)
             publish()
         options = discover_danmaku_sources(result, chosen, progress, on_update=source_update)
-        result.warnings.extend(f"{PLATFORM_NAMES[option.platform]}未取得弹幕：{option.error}" for option in options if not option.available)
+        result.warnings.extend(f"{platform_name(option.platform)}未取得弹幕：{option.error}" for option in options if not option.available)
         if any(option.available for option in options):
             select_danmaku_source(result, chosen)
     else:
@@ -3720,7 +3954,7 @@ class App:
         summary = source_summary(options) if movie else ("请先在电影列表选择具体电影或剧集，再获取弹幕。"
             if r and r.movies else "未匹配到电影来源，可修正片名或手动补选弹幕。")
         if r and r.source_pending:
-            summary += ("；查询中：" if self.busy else "；待重试：") + "、".join(PLATFORM_NAMES[key] for key in r.source_pending)
+            summary += ("；查询中：" if self.busy else "；待重试：") + "、".join(dict.fromkeys(platform_name(key) for key in r.source_pending))
         self.source_status.set(summary + ("；未取得的原因见下方日志。" if any(not option.available for option in options or []) else ""))
 
     def change_platform(self, _=None):
@@ -3748,7 +3982,7 @@ class App:
         keep_manual = retry_failed and r.danmaku_source.startswith("手动补选") and bool(r.comments or r.dm_ass)
         if not retry_failed:
             clear_selected_danmaku(r)
-            r.source_pending = [platform for platform in PLATFORM_NAMES if platform in movie["links"] and
+            r.source_pending = [platform for platform in movie_source_links(movie) if
                                 not any(row.platform == platform for row in r.source_catalog.get(key, []))]
         self.refresh_platforms()
         self.show_danmaku()
@@ -3768,7 +4002,7 @@ class App:
             self.show_danmaku()
             for option in options:
                 if final and not option.available:
-                    self.log(f"{PLATFORM_NAMES[option.platform]}未取得弹幕：{option.error}")
+                    self.log(f"{platform_name(option.platform)}未取得弹幕：{option.error}")
             self.status.set("已列出弹幕来源与条数，切换直接使用本机缓存。" if any(option.available for option in options)
                             else "当前候选未取得在线弹幕，可重查来源、换候选或补选文件。")
             self.update_ready()

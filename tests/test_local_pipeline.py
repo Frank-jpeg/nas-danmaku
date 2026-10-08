@@ -27,7 +27,7 @@ class LocalPipelineTests(unittest.TestCase):
         fixture = patch.object(d, 'local_workspace', return_value=self.cache)
         fixture.start()
         self.addCleanup(fixture.stop)
-        for name in ('subhd_subtitles', 'subtitlecat_subtitles'):
+        for name in ('subhd_subtitles', 'subtitlecat_subtitles', 'search_danmubox'):
             fixture = patch.object(d, name, return_value=[])
             fixture.start()
             self.addCleanup(fixture.stop)

@@ -17,7 +17,8 @@ class DandanplayTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.folder = Path(self.tmp.name)
         for mock in (patch.dict(os.environ, {'LOCALAPPDATA': self.tmp.name, 'DANDANPLAY_APP_ID': '', 'DANDANPLAY_APP_SECRET': ''}),
-                     patch.object(d, 'local_backup_folder', return_value=self.folder / 'backups')):
+                     patch.object(d, 'local_backup_folder', return_value=self.folder / 'backups'),
+                     patch.object(d, 'search_danmubox', return_value=[])):
             mock.start()
             self.addCleanup(mock.stop)
         self.config = dict(enabled=True, app_id='testapp', secret='testsecret')

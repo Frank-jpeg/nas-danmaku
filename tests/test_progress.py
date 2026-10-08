@@ -120,6 +120,7 @@ class WorkProgressTests(unittest.TestCase):
             video.write_bytes(b'test')
             updates = []
             with patch.object(d, 'inspect_video', return_value={}), \
+                    patch.object(d, 'search_danmubox', return_value=[]), \
                     patch.object(d, 'local_workspace', return_value=Path(tmp).resolve()), \
                     patch.object(d, 'discover_subtitles', return_value=([], [])), \
                     patch.object(d, 'search_movies', return_value=[]):

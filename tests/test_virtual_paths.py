@@ -45,6 +45,7 @@ class VirtualPathTests(unittest.TestCase):
             movie = {'title': '电影', 'year': '2020', 'duration': '0:00:10',
                      'links': {'qq': 'https://v.qq.com/x/cover/test.html'}}
             with patch.object(Path, 'resolve', side_effect=unsupported_volume()), \
+                 patch.object(d, 'search_danmubox', return_value=[]), \
                  patch.object(d, 'inspect_video', return_value=meta), \
                  patch.object(d, 'search_movies', return_value=[movie]), \
                  patch.object(d, 'fetch_public_danmaku', return_value=([d.Comment(2, '弹幕')], '测试源', '')):

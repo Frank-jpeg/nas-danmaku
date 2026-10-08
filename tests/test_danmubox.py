@@ -173,6 +173,29 @@ class DanmuboxTests(unittest.TestCase):
         self.assertNotIn('danmubox', result.movies[0])
         self.assertEqual(result.movies[1]['danmubox'], [ENTRY])
 
+    def test_abbreviated_query_uses_resolved_movie_title_and_year_for_archives(self):
+        entry = dict(ENTRY, name='肖申克的救赎 [新上架版]')
+        movie = dict(title='肖申克的救赎', year='1994', duration='', links={'qq': 'https://v.qq.com/x/test'})
+        wrong = dict(movie, title='其他电影', links={})
+        def search(title, year='', progress=None):
+            return [entry] if (title, year) == ('肖申克的救赎', '1994') else []
+        with patch.object(d, 'dandan_config', return_value={'enabled': False}), \
+                patch.object(d, 'search_movies', return_value=[movie, dict(movie), wrong]), \
+                patch.object(d, 'search_danmubox', side_effect=search) as lookup, \
+                patch.object(d, 'discover_subtitles', return_value=([], [])), \
+                patch.object(d, 'web_bytes', return_value=archive()):
+            result = d.scan_movie(None, '肖申克')
+        self.assertEqual(result.movies[0].get('danmubox'), [entry])
+        self.assertEqual(result.movies[1].get('danmubox'), [entry])
+        self.assertNotIn('danmubox', result.movies[2])
+        queries = [call.args[:2] for call in lookup.call_args_list]
+        self.assertEqual(queries.count(('肖申克的救赎', '1994')), 1)
+        self.assertFalse(any('未找到匹配归档' in warning for warning in result.warnings))
+        options = result.source_catalog[d.movie_source_key(result.movies[0])]
+        archive_option = next(row for row in options if row.platform.startswith('danmubox:'))
+        self.assertTrue(archive_option.available)
+        self.assertIn('新上架版', archive_option.label)
+
 
 if __name__ == '__main__':
     unittest.main()

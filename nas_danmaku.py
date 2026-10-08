@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.10.0"
+VERSION = "2.10.1"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -1079,6 +1079,7 @@ NAS 写回失败会保留本机成品和待写回记录，重启后可恢复；�
 选中电影后，自动核实其已找到链接的各个平台，显示来源和实际取得的原始弹幕条数。
 “来源”只列出已取得并缓存的弹幕，切换直接用本机缓存。未取得的来源单独标注，详细原因见日志。
 弹幕盒子历史归档也会按片名查询，成功后进入“来源”；不同版本分别显示名称和实际条数，不自动混合。
+输入简称时，还会用电影搜索识别出的完整片名和年份匹配归档。
 目录缓存 24 小时；7z 归档需要本机已有 7-Zip。归档是历史保存量，请核对电影版本和时间轴。
 “重查来源”重试未取得、未完成及部分取得的项目，保留完整成功来源；补取失败仍保留原数据。
 B 站直连失败后使用第三方缓存，会标注“第三方缓存，可重试”；条数仅代表本次取得量，完整性未验证。
@@ -2695,17 +2696,27 @@ def scan_movie(video, override="", progress=lambda _: None, on_update=None):
             notices.append("其他电影来源未取得：" + str(exc))
         movies = ([movie for movie in official if not movie.get("official_confirm")] + fallback +
                   [movie for movie in official if movie.get("official_confirm")])
-        try:
-            archives = search_danmubox(identity["title"], identity["year"])
-        except (ToolError, OSError) as exc:
-            archives = []
-            notices.append("弹幕盒子历史目录未取得：" + str(exc))
+        requested = (identity["title"], identity["year"])
+        # A short query may resolve to a full movie title on the other services.
+        # Search those titles too, then bind each archive to its own movie/year.
+        archive_queries = [requested] + [(movie.get("official_title", movie["title"]), movie.get("year", "")) for movie in movies]
+        archive_results = {}
+        for query in dict.fromkeys(archive_queries):
+            try:
+                archive_results[query] = search_danmubox(*query, progress=progress)
+            except (ToolError, OSError) as exc:
+                notices.append("弹幕盒子历史目录未取得：" + str(exc))
+                break
         else:
-            if not archives:
+            if not any(archive_results.values()):
                 notices.append("弹幕盒子未找到匹配归档，可尝试其他片名，或从网页下载后补选。")
+        archives = archive_results.get(requested, [])
         attached = False
         for index, movie in enumerate(movies):
-            matches = [row for row in archives if danmubox_matches(row["name"], movie.get("official_title", movie["title"]), movie.get("year", ""))]
+            query = (movie.get("official_title", movie["title"]), movie.get("year", ""))
+            candidates = archives + archive_results.get(query, [])
+            unique = {(row["repo"], row["file"]): row for row in candidates if danmubox_matches(row["name"], *query)}
+            matches = sorted(unique.values(), key=lambda row: (-row["size"], row["name"]))[:8]
             if matches:
                 movies[index] = dict(movie, danmubox=matches)
                 attached = True

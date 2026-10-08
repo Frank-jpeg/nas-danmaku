@@ -40,7 +40,10 @@ class DandanplayTests(unittest.TestCase):
         with patch.object(d, 'dandan_config', return_value=self.config), \
                 patch.object(d, 'web_bytes', return_value=b'{"success":true,"matches":[]}') as network:
             d.dandan_request('/api/v2/match', {'fileName': 'film'})
-            d.dandan_request('/api/v2/match', {'fileName': 'film'})
+            cache = next((d.filter_rules_path().parent / 'cache/dandanplay').glob('*.json'))
+            # Test a fresh cache deterministically, independently of host clock precision.
+            with patch.object(d.time, 'time', return_value=cache.stat().st_mtime + 1):
+                d.dandan_request('/api/v2/match', {'fileName': 'film'})
             self.assertEqual(network.call_count, 1)
             self.assertEqual(network.call_args.kwargs['request_headers']['Content-Type'], 'application/json')
             self.assertEqual(json.loads(network.call_args.kwargs['data']), {'fileName': 'film'})

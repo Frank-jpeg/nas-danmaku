@@ -138,7 +138,7 @@ class FilterRulesTests(unittest.TestCase):
         comments = [d.Comment(0, '广告123'), d.Comment(.1, '正常剧情'), d.Comment(2.2, '在吗')]
         doc, omitted = d.render_comments(comments, (1920, 1080), filter_rules=rules, filter_stats=stats)
         self.assertEqual(omitted, 1)
-        self.assertEqual(stats, {'noise': 0, 'keywords': 1})
+        self.assertEqual(stats, {'noise': 0, 'keywords': 1, 'types': 0, 'duplicates': 0, 'density': 0, 'time': 0})
         self.assertEqual([row['Start'] for row in doc.events], ['0:00:00.10', '0:00:02.20'])
 
 

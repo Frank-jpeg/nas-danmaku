@@ -58,7 +58,7 @@ class NoiseFilterTests(unittest.TestCase):
         stats = {}
         doc, omitted = d.render_comments(comments, (1920, 1080),
                                          block_keywords='指定词', filter_stats=stats)
-        self.assertEqual(stats, {'noise': 2, 'keywords': 1})
+        self.assertEqual(stats, {'noise': 2, 'keywords': 1, 'types': 0, 'duplicates': 0, 'density': 0, 'time': 0})
         self.assertEqual(omitted, 3)
         self.assertEqual([row['Start'] for row in doc.events], ['0:00:00.10', '0:00:02.30'])
         self.assertEqual(len(comments), 5)

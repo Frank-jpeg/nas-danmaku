@@ -30,9 +30,9 @@ import webbrowser
 import zipfile
 import zlib
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.6.2"
+VERSION = "2.7.0"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -44,6 +44,10 @@ DM_DEFAULTS = dict(font_size=32, duration=DEFAULT_DANMAKU_DURATION, area=25, opa
 
 
 class ToolError(Exception):
+    pass
+
+
+class TaskCancelled(Exception):
     pass
 
 
@@ -669,8 +673,7 @@ def save_filter_rules(rules, path=None, backup_dir=None):
         if path.exists():
             if path.read_text(encoding="utf-8") == content:
                 return
-            backups = Path(backup_dir) if backup_dir is not None else (
-                Path("D:/临时备份/NasDanmaku") if os.name == "nt" else path.parent / "backups")
+            backups = Path(backup_dir) if backup_dir is not None else local_backup_folder()
             backups.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, backups / ("block-rules-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8] + ".json"))
         with temporary.open("x", encoding="utf-8", newline="\n") as handle:
@@ -681,6 +684,107 @@ def save_filter_rules(rules, path=None, backup_dir=None):
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def local_backup_folder():
+    return Path("D:/临时备份/NasDanmaku") if os.name == "nt" else filter_rules_path().parent / "backups"
+
+
+def save_local_json(name, data):
+    """Replace local state atomically, backing up every existing configuration."""
+    path = filter_rules_path().with_name(name)
+    content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        if path.exists():
+            if path.read_text(encoding="utf-8") == content:
+                return
+            backups = local_backup_folder()
+            backups.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, backups / (path.stem + "-" + uuid.uuid4().hex + ".json"))
+        with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+        os.replace(temporary, path)
+    except (OSError, UnicodeError) as exc:
+        raise ToolError("本机记录未保存（备份或写入失败）：" + str(exc)) from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_local_json(name, default):
+    path = filter_rules_path().with_name(name)
+    if not path.exists():
+        return copy.deepcopy(default)
+    try:
+        if path.stat().st_size > 2 * 1024 * 1024:
+            raise ValueError("文件过大")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("version") != 1:
+            raise ValueError("版本或格式不支持")
+        return data
+    except (OSError, ValueError) as exc:
+        raise ToolError(f"读取 {name} 失败，原文件已保留：{exc}") from exc
+
+
+def validate_preferences(settings, density):
+    result = {key: settings[key] for key in DM_DEFAULTS if key not in ("filter_rules", "block_keywords")}
+    for key in ("duration", "font_size", "area", "opacity"):
+        result[key] = finite(result[key], key)
+    for key in ("block_scroll", "block_fixed", "block_color", "avoid_subtitles", "deduplicate", "block_noise"):
+        if not isinstance(result[key], bool):
+            raise ToolError("显示设置开关格式错误。")
+    if result["block_scroll"] and result["block_fixed"]:
+        raise ToolError("滚动和固定不能同时屏蔽。")
+    render_comments([Comment(0, "设置校验")], (1920, 1080), density=density,
+                    **dict(result, block_noise=False, filter_rules=[]))
+    return result
+
+
+def load_preferences():
+    data = load_local_json("preferences.local.json", {"version": 1, "settings": {}, "density": 6, "offsets": {}})
+    try:
+        settings = dict(DM_DEFAULTS, **data.get("settings", {}))
+        validate_preferences(settings, data.get("density", 6))
+        offsets = data.get("offsets", {})
+        if not isinstance(offsets, dict):
+            raise ToolError("影片偏移记录格式错误。")
+        settings.update(validate_preferences(settings, data.get("density", 6)))
+        return settings, int(data.get("density", 6)), {key: finite(value) for key, value in offsets.items()}
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ToolError("显示设置格式错误：" + str(exc)) from exc
+
+
+def video_preference_key(video):
+    return os.path.normcase(os.path.abspath(str(video)))
+
+
+def store_preferences(settings, density, offsets):
+    clean = validate_preferences(settings, density)
+    save_local_json("preferences.local.json", dict(version=1, settings=clean, density=int(density),
+                                                    offsets=dict(list(offsets.items())[-200:])))
+
+
+def pending_outputs():
+    data = load_local_json("pending-outputs.local.json", {"version": 1, "items": []})
+    rows = data.get("items")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) or not all(key in row for key in
+            ("local_output", "video", "signature", "target")) for row in rows):
+        raise ToolError("待写回记录格式错误，原文件已保留。")
+    for row in rows:
+        if any(not isinstance(row[key], str) or not row[key] for key in ("local_output", "video", "target")) or \
+                not isinstance(row["signature"], (list, tuple)) or len(row["signature"]) != 2:
+            raise ToolError("待写回记录格式错误，原文件已保留。")
+    return rows
+
+
+def remember_output(value, remove=False):
+    with LOCAL_STATE_LOCK:
+        rows = pending_outputs()
+        rows = [row for row in rows if row["local_output"] != value["local_output"]]
+        if not remove:
+            rows.append(dict(value))
+        save_local_json("pending-outputs.local.json", dict(version=1, items=rows))
 
 
 def render_comments(comments, resolution, offset=0, density=6, duration=DEFAULT_DANMAKU_DURATION, font_size=32, progress=None,
@@ -696,7 +800,7 @@ def render_comments(comments, resolution, offset=0, density=6, duration=DEFAULT_
         raise ToolError("显示区域和不透明度范围均为 10–100%。")
     keywords = compile_block_keywords(block_keywords)
     if filter_stats is not None:
-        filter_stats.update(noise=0, keywords=0)
+        filter_stats.update(noise=0, keywords=0, types=0, duplicates=0, density=0, time=0)
     size = font_size * height / 1080
     top, row_height = height * .025, size * 1.45
     bottom = height * min(area / 100, .68 if avoid_subtitles else 1)
@@ -730,6 +834,8 @@ def render_comments(comments, resolution, offset=0, density=6, duration=DEFAULT_
         fixed = comment.mode in (4, 5)
         if (fixed and block_fixed) or (not fixed and block_scroll) or (block_color and comment.color != 0xFFFFFF):
             omitted += 1
+            if filter_stats is not None:
+                filter_stats["types"] += 1
             continue
         if matches[index]:
             omitted += 1
@@ -739,12 +845,16 @@ def render_comments(comments, resolution, offset=0, density=6, duration=DEFAULT_
         message = escape_text(comment.text)[:120]
         if original_at < 0 or (deduplicate and message in seen and at - seen[message] < 15):
             omitted += 1
+            if filter_stats is not None:
+                filter_stats["time" if original_at < 0 else "duplicates"] += 1
             continue
         for active in occupants:
             active[:] = [item for item in active if item[1] > at]
         # 均匀准入，避免开头瞬间填满上限后等待整批离场；不挪动原弹幕时间。
         if sum(map(len, occupants)) >= density or (not fixed and at + 1e-9 < next_scroll):
             omitted += 1
+            if filter_stats is not None:
+                filter_stats["density"] += 1
             continue
         units = sum(1 if unicodedata.east_asian_width(c) in "WF" else .65 for c in message)
         length = round(max(size, units * size * 1.2), 2)
@@ -766,6 +876,8 @@ def render_comments(comments, resolution, offset=0, density=6, duration=DEFAULT_
         candidates = [i for i in order if can_enter(occupants[i])]
         if not candidates:
             omitted += 1
+            if filter_stats is not None:
+                filter_stats["density"] += 1
             continue
         lane = candidates[0] if fixed else min(candidates, key=lambda i: (len(occupants[i]), last_entry[i]))
         seen[message] = at
@@ -928,6 +1040,7 @@ import difflib
 import gzip
 import queue
 import threading
+LOCAL_STATE_LOCK = threading.Lock()
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -952,13 +1065,14 @@ ZIP 字幕包直接读取；7z/RAR 包需要本机已有 7-Zip。只下载现成
 若只有 PGS/SUP 图片字幕且在线未找到文字字幕，会明确提示；本工具不做 OCR、不假装已成功。
 内封字幕只在手动点“使用内封”后选用；提取可能需扫描影片，异地较慢。
 台词和弹幕先缓存到本机，合成后仅将最终 ASS 写回 NAS；不下载整部视频。
-NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS”，不用重新合成。
+NAS 写回失败会保留本机成品和待写回记录，重启后可恢复；“待写回任务”可选择其他任务。
+可以打开成品文件夹、复制路径。重试只写回原任务，不使用当前新影片的目录。
 缓存和成品保存在 %LOCALAPPDATA%/NasDanmaku/cache，界面日志会显示具体目录。
 
-弹幕：按片名通过 360 影视查找电影平台链接，再向公开弹幕库按需请求；不需要你填密钥。
+弹幕：按片名通过 360 影视查找电影平台链接，B 站优先直连合并 XML 与分段，其他平台向公开弹幕库按需请求；不需要你填密钥。
 选中电影后，自动核实其已找到链接的各个平台，显示来源和实际取得的原始弹幕条数。
 “来源”只列出已取得并缓存的弹幕，切换直接用本机缓存。未取得的来源单独标注，详细原因见日志。
-“重查来源”仅重试未取得的项目，保留已成功来源，不重新读取 NAS 或下载台词。其他电影候选选中后再查。
+“重查来源”重试未取得、未完成及部分取得的项目，保留完整成功来源；补取失败仍保留原数据。
 公开服务： https://dmku.hls.one/ ；备用 https://danmu.zxz.ee/ 。
 在线字幕：迅雷、SubHD 按片名查询；射手按视频指纹查询；SubtitleCat 作为可能机翻的末位备用。
 这些外部服务可能变更/限流、没有某部电影的数据。失败会显示原因，支持修改片名重新识别或手动补选文件。
@@ -974,18 +1088,21 @@ NAS 写回失败会保留本机成品，恢复连接后可点“重试写回 NAS
 每条规则都有用途、屏蔽/保留示例和实际匹配内容；日期等组合规则可通过下拉列表逐项编辑。
 可新增普通关键词（包含就屏蔽），也可新增正则（按写法规律匹配）。不懂正则，直接用关键词即可。
 输入一句弹幕点“测试这句弹幕”，能看到是否屏蔽、具体命中了哪些规则；示例文字仅作说明。
-“保存规则”后返回，再点“应用设置”。规则及各条开关保存在本机，重启仍保留；自定义规则独立于内置总开关。
+规则点击“保存并生效”即可保存在本机；退出未保存编辑时会提示。自定义规则独立于内置总开关。
 规则文件：%LOCALAPPDATA%/NasDanmaku/block-rules.local.json；修改已有文件前备份到 D:/临时备份/NasDanmaku。
 正则只检查不超过 180 字的弹幕；错误写法会提示，修改后的正则匹配超时会停止，不会卡住一直等待。
 过滤发生在合成时，仅影响在线/XML/JSON 弹幕；原始缓存和台词不变，日志显示屏蔽数量。
 “弹幕设置”可调显示区域、字号、不透明度、速度及类型过滤；只影响弹幕，不改原台词字幕。
 勾选防挡字幕时，即使放大区域也会保留底部 32%；固定弹幕手动开启后同样限制在所选区域内。
-字号、区域等显示设置和内置总开关保留在当前窗口，重启恢复默认；屏蔽规则列表会记住。
+显示设置和同屏数量会记住；弹幕偏移按影片完整路径分别保存。换影片默认使用该片上次偏移，没有记录则为零。
 调整后点确认合成，无需重新下载；已有 ASS 不会自动改变。
 手动导入的 ASS 已有排版，只支持时间偏移；要调整区域和字号请用在线弹幕或 XML/JSON。
 字幕与弹幕同属一条 ASS，播放时选择这条字幕即可。想仅看台词，选回原字幕轨。
 
+查询结果陆续显示；已有字幕和弹幕后，可点“使用已取得结果合成”结束等待。
+“停止等待”保留已有结果并解除界面等待，尚在连接的请求会在完成或超时后退出；合成与写回不支持中途取消。
 进度条表示当前步骤；切换步骤时会归零。没有可用总量时只显示等待/接收量和耗时。
+底部显示原始条数、最终条数和分类过滤数量；窗口内容支持滚动，操作区固定在底部。
 双击 .py 或运行 python nas_danmaku.py；也可把影片路径作为第一个参数传入。
 """
 
@@ -1777,6 +1894,7 @@ def fetch_bilibili_danmaku(url, progress=None):
 
             def fetch_segment(index):
                 try:
+                    report(progress, f"下载 B 站分段 {index}/{count}")
                     raw = web_bytes(f"https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid={cid}&segment_index={index}",
                                     request_headers=headers, timeout=20)
                     return bili_segment_rows(raw), ""
@@ -1856,8 +1974,12 @@ class DanmakuSource:
         return bool(self.comments) and not self.error
 
     @property
+    def partial(self):
+        return self.available and "部分获取" in self.source
+
+    @property
     def label(self):
-        return f"{PLATFORMS[self.platform]} · {len(self.comments):,} 条" if self.available else f"{PLATFORMS[self.platform]} · 未取得"
+        return (f"{PLATFORMS[self.platform]} · {len(self.comments):,} 条" + ("（部分取得，可重试）" if self.partial else "")) if self.available else f"{PLATFORMS[self.platform]} · 未取得"
 
 
 def movie_source_key(movie):
@@ -1885,32 +2007,51 @@ def cached_comment_file(comments, folder, name="danmaku.json", progress=None):
     return save_new(Path(folder) / name, text, progress, "缓存弹幕到本机")
 
 
-def discover_danmaku_sources(result, movie, progress=None, retry_failed=False):
+def discover_danmaku_sources(result, movie, progress=None, retry_failed=False, on_update=None):
     key = movie_source_key(movie)
     previous = result.source_catalog.get(key)
     if previous is not None and not retry_failed:
         return previous
     retained = {option.platform: option for option in previous or [] if option.available}
     keys = [platform for platform in PLATFORMS if platform in movie["links"]]
-    pending = [platform for platform in keys if platform not in retained]
+    pending = [platform for platform in keys if platform not in retained or retained[platform].partial]
     if result.workspace is None:
         result.workspace = local_workspace()
+    result.source_pending = list(pending)
     def fetch(platform):
         try:
-            comments, source, url = fetch_public_danmaku(movie, lambda _: None, platform=platform)
+            def detail(update):
+                message = update.message if isinstance(update, ProgressUpdate) else str(update)
+                if progress:
+                    progress(ProgressUpdate(f"{PLATFORMS[platform]}：{message}"))
+            comments, source, url = fetch_public_danmaku(movie, detail, platform=platform)
             if not comments:
                 raise ToolError("该来源未返回可用弹幕。")
             path = cached_comment_file(comments, result.workspace, f"danmaku-{platform}.json")
             return DanmakuSource(platform, comments, source, url, str(path))
         except (ToolError, OSError, ValueError) as exc:
             return DanmakuSource(platform, error=str(exc))
+    def publish():
+        result.source_catalog[key] = [retained[platform] for platform in keys if platform in retained]
+        if on_update:
+            on_update(result.source_catalog[key])
     # 同时最多查询三个平台；查询已结束（成功须已缓存）即计数，不混合多路下载字节。
     if pending:
+        publish()
         report(progress, "核实各平台弹幕并缓存", 0, len(pending), "个来源")
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(pending))) as pool:
             futures = {pool.submit(fetch, platform): platform for platform in pending}
             for count, future in enumerate(concurrent.futures.as_completed(futures), 1):
-                retained[futures[future]] = future.result()
+                platform = futures[future]
+                fresh = future.result()
+                old = retained.get(platform)
+                if old and old.available and (not fresh.available or fresh.partial):
+                    detail = fresh.error or "接口仍未全部成功"
+                    retained[platform] = dataclass_replace(old, source=old.source.split("；补取未完成", 1)[0] + "；补取未完成，保留原数据：" + detail)
+                else:
+                    retained[platform] = fresh
+                result.source_pending.remove(platform)
+                publish()
                 report(progress, "核实各平台弹幕并缓存", count, len(pending), "个来源", complete=count == len(pending))
     options = [retained[platform] for platform in keys]
     result.source_catalog[key] = options
@@ -1951,6 +2092,7 @@ class ScanResult:
     source_catalog: dict = field(default_factory=dict)
     selected_movie_key: tuple | None = None
     selected_platform: str = ""
+    source_pending: list = field(default_factory=list)
 
 
 def file_signature(video):
@@ -1958,7 +2100,7 @@ def file_signature(video):
     return info.st_size, info.st_mtime_ns
 
 
-def scan_movie(video, override="", progress=lambda _: None):
+def scan_movie(video, override="", progress=lambda _: None, on_update=None):
     video = normalize_path(video)
     validate_video(video)
     signature = file_signature(video)
@@ -1975,6 +2117,10 @@ def scan_movie(video, override="", progress=lambda _: None):
         title, year = filename_title(video.stem)
         identity = {"title": override.strip() or title, "year": year, "source": "修正片名" if override.strip() else "文件名"}
     result = ScanResult(video, identity, meta, signature, warnings=warnings, workspace=local_workspace())
+    def publish():
+        if on_update:
+            on_update(result)
+    publish()
     progress(f"识别片名：{identity['title']} {identity['year']}；正在查找字幕和电影弹幕…")
     report(progress, "查找字幕和电影来源", 0, 2, "项")
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -1991,6 +2137,7 @@ def scan_movie(video, override="", progress=lambda _: None):
                 label = "字幕识别失败：" if future is sub_future else "电影弹幕搜索失败："
                 result.warnings.append(label + str(exc))
             report(progress, "查找字幕和电影来源", count, 2, "项", complete=count == 2)
+            publish()
     if result.movies:
         chosen = result.movies[0]
         if identity["year"] and chosen["year"] and identity["year"] != chosen["year"]:
@@ -2003,7 +2150,11 @@ def scan_movie(video, override="", progress=lambda _: None):
                 result.warnings.append(f"片长差异较大：当前文件约 {length / 60:.1f} 分钟，平台标记 {chosen['duration']}，请确认是否同一版本。")
         except (ValueError, ToolError):
             pass
-        options = discover_danmaku_sources(result, chosen, progress)
+        def source_update(options):
+            if any(option.available for option in options):
+                select_danmaku_source(result, chosen)
+            publish()
+        options = discover_danmaku_sources(result, chosen, progress, on_update=source_update)
         result.warnings.extend(f"{PLATFORMS[option.platform]}未取得弹幕：{option.error}" for option in options if not option.available)
         if any(option.available for option in options):
             select_danmaku_source(result, chosen)
@@ -2067,6 +2218,7 @@ def synthesize(result, subtitle_index=0, offset=0, density=6, duration=DEFAULT_D
                                        block_noise=block_noise, block_keywords=block_keywords, filter_stats=filter_stats,
                                        filter_rules=filter_rules)
         filtered += len(result.comments) - len(comments)
+        filter_stats["time"] += len(result.comments) - len(comments)
     progress("合并台词和弹幕")
     final = merge_ass(base, dm)
     target = result.video.with_name(f"弹幕版-{result.video.stem}.ass")
@@ -2075,12 +2227,20 @@ def synthesize(result, subtitle_index=0, offset=0, density=6, duration=DEFAULT_D
              "signature": result.signature, "target": str(target), "subtitle_lines": len(base.events),
              "danmaku_lines": len(dm.events), "filtered": filtered,
              "noise_filtered": filter_stats["noise"], "keyword_filtered": filter_stats["keywords"]}
+    value["filter_stats"] = filter_stats
+    value["raw_count"] = len(result.dm_ass.events) if result.dm_ass is not None else len(result.comments)
     return publish_cached(value, progress)
 
 
 def publish_cached(value, progress=lambda _: None):
     value = dict(value, saved=False, write_error="")
     value["output"] = value["local_output"]
+    try:
+        remember_output(value)
+    except (ToolError, OSError) as exc:
+        # Do not risk losing the only recovery path when saving the record failed.
+        value["write_error"] = str(exc)
+        return value
     try:
         progress("本地合成已完成，检查 NAS 后写回…")
         if file_signature(value["video"]) != tuple(value["signature"]):
@@ -2091,6 +2251,10 @@ def publish_cached(value, progress=lambda _: None):
         progress("本地结果已保留，NAS 写回未完成，可重试写回")
         return value
     value.update(output=str(output), saved=True)
+    try:
+        remember_output(value, remove=True)
+    except (ToolError, OSError) as exc:
+        value["recovery_warning"] = "文件已写回，清理待写回记录失败：" + str(exc)
     return value
 
 
@@ -2137,6 +2301,43 @@ def copy_to_video_dir(source, target, progress=None):
 
 # ---- 一个窗口：选择、展示、确认合成 ----
 
+def scrollable_window(window, width, height):
+    """Keep actions outside a scrollable body and fit the current screen."""
+    width = min(width, max(320, window.winfo_screenwidth() - 80))
+    height = min(height, max(280, window.winfo_screenheight() - 120))
+    window.geometry(f"{width}x{height}")
+    window.minsize(min(width, 560), min(height, 380))
+    footer = ttk.Frame(window, padding=(12, 6))
+    footer.pack(side="bottom", fill="x")
+    holder = ttk.Frame(window)
+    holder.pack(fill="both", expand=True)
+    canvas = tk.Canvas(holder, highlightthickness=0)
+    vertical = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+    horizontal = ttk.Scrollbar(holder, orient="horizontal", command=canvas.xview)
+    horizontal.pack(side="bottom", fill="x")
+    vertical.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+    body = ttk.Frame(canvas, padding=12)
+    item = canvas.create_window(0, 0, window=body, anchor="nw")
+    body.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>", lambda event: canvas.itemconfigure(item, width=max(event.width, body.winfo_reqwidth())))
+    def wheel(event):
+        if isinstance(event.widget, (tk.Text, ttk.Treeview, ttk.Combobox, ttk.Spinbox)):
+            return
+        canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+    window.bind("<MouseWheel>", wheel, add="+")
+    window.bind("<Next>", lambda _: canvas.yview_scroll(1, "pages"), add="+")
+    window.bind("<Prior>", lambda _: canvas.yview_scroll(-1, "pages"), add="+")
+    return body, footer
+
+
+def wrapped_label(parent, **kwargs):
+    label = ttk.Label(parent, **kwargs)
+    label.pack(anchor="w", fill="x")
+    parent.bind("<Configure>", lambda event: label.configure(wraplength=max(180, event.width - 24)), add="+")
+    return label
+
 def elapsed_text(seconds):
     seconds = max(0, int(seconds))
     return f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
@@ -2170,14 +2371,13 @@ class FilterRulesDialog:
     def __init__(self, parent):
         self.parent = parent
         self.rules = rules_with_keywords(parent.rule_rows, compile_block_keywords(parent.variables["block_keywords"].get()))
+        self.original_rules = copy.deepcopy(self.rules)
         self.selected = None
         self.current_part = None
         self.window = tk.Toplevel(parent.window)
         self.window.title("弹幕屏蔽规则 · 内置和自定义")
-        self.window.geometry("860x760")
-        self.window.minsize(780, 710)
-        frame = ttk.Frame(self.window, padding=12)
-        frame.pack(fill="both", expand=True)
+        frame, footer = scrollable_window(self.window, 860, 760)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
         ttk.Label(frame, text="内置规则也能修改、停用或删除。普通关键词包含就屏蔽；正则用于匹配日期等写法规律。", wraplength=820).pack(anchor="w")
         self.tree = ttk.Treeview(frame, columns=("enabled", "source", "name", "kind"), show="headings", height=6, selectmode="browse")
         for key, label, width in (("enabled", "启用", 55), ("source", "来源", 65), ("name", "规则名称", 210), ("kind", "匹配方式", 330)):
@@ -2231,11 +2431,10 @@ class FilterRulesDialog:
         self.test_button.pack(side="left", padx=(6, 0))
         self.notice = tk.StringVar(value="测试按当前总开关和各条开关执行，显示命中的具体规则。示例只是说明，修改后请测试核对。")
         ttk.Label(frame, textvariable=self.notice, wraplength=820).pack(anchor="w", pady=8)
-        row = ttk.Frame(frame)
-        row.pack(fill="x")
-        ttk.Label(row, text="保存后返回，再点“应用设置”；规则会保存在本机。", foreground="#606975").pack(side="left")
-        ttk.Button(row, text="保存规则", command=self.save).pack(side="right")
-        ttk.Button(row, text="取消", command=self.window.destroy).pack(side="right", padx=6)
+        row = footer
+        ttk.Label(row, text="保存即生效。", foreground="#606975").pack(side="left")
+        ttk.Button(row, text="保存并生效", command=self.save).pack(side="right")
+        ttk.Button(row, text="取消", command=self.close).pack(side="right", padx=6)
         self.refresh()
 
     def flush(self):
@@ -2355,13 +2554,27 @@ class FilterRulesDialog:
     def save(self):
         self.flush()
         try:
+            if self.parent.app.busy:
+                raise ToolError("当前任务正在处理，请结束后保存规则。")
             compile_filter_rules(self.rules)
-        except ToolError as exc:
+            save_filter_rules(self.rules)
+        except (ToolError, OSError) as exc:
             self.notice.set(str(exc))
             return
+        self.parent.app.render_settings["filter_rules"] = copy.deepcopy(self.rules)
         self.parent.rule_rows = copy.deepcopy(self.rules)
         self.parent.variables["block_keywords"].set("")
         self.parent.keyword_button.configure(text=f"屏蔽规则 · {len(self.rules)} 条")
+        self.window.destroy()
+
+    def close(self):
+        self.flush()
+        if self.rules != self.original_rules:
+            answer = messagebox.askyesnocancel("规则尚未保存", "保存修改并生效吗？选“否”丢弃本次修改。", parent=self.window)
+            if answer is None:
+                return
+            if answer:
+                return self.save()
         self.window.destroy()
 
 
@@ -2370,9 +2583,7 @@ class DanmakuSettingsDialog:
         self.app = app
         self.window = tk.Toplevel(app.root)
         self.window.title("弹幕设置")
-        self.window.resizable(False, False)
-        frame = ttk.Frame(self.window, padding=12)
-        frame.pack(fill="both", expand=True)
+        frame, footer = scrollable_window(self.window, 600, 740)
         current = app.render_settings
         self.rule_rows = copy.deepcopy(current["filter_rules"] if current["filter_rules"] is not None else default_filter_rules())
         self.rules_dialog = None
@@ -2416,8 +2627,7 @@ class DanmakuSettingsDialog:
         self.canvas.pack(pady=(0, 6))
         self.note = tk.StringVar()
         ttk.Label(frame, textvariable=self.note, foreground="#606975", wraplength=512).pack(anchor="w")
-        row = ttk.Frame(frame)
-        row.pack(fill="x", pady=(12, 0))
+        row = footer
         ttk.Button(row, text="恢复默认", command=self.reset).pack(side="left")
         ttk.Button(row, text="应用设置", command=self.apply).pack(side="right")
         ttk.Button(row, text="取消", command=self.window.destroy).pack(side="right", padx=6)
@@ -2501,10 +2711,12 @@ class DanmakuSettingsDialog:
                             **dict(settings, block_noise=False, block_keywords="", filter_rules=[]))
             if settings["filter_rules"] != self.app.render_settings["filter_rules"]:
                 save_filter_rules(settings["filter_rules"])
+            store_preferences(settings, density, self.app.saved_offsets)
         except (ToolError, ValueError, OSError, tk.TclError, ZeroDivisionError) as exc:
             self.note.set("请检查设置：" + str(exc))
             return
         self.app.render_settings = settings
+        self.app.preferences_readable = True
         self.app.density.set(str(density))
         self.app.settings_summary.set(self.app.settings_description())
         self.app.status.set("弹幕设置已应用；点击确认合成后生效，无需重新下载。")
@@ -2515,10 +2727,13 @@ class App:
     def __init__(self, root, initial=""):
         self.root = root
         root.title("字幕＋弹幕 · 一键合成 v" + VERSION)
-        root.geometry("900x780")
-        root.minsize(860, 760)
         self.result = None
         self.pending_output = None
+        self.last_output = None
+        self.task_id = 0
+        self.cancel_event = threading.Event()
+        self.task_local = threading.local()
+        self.cancellable = False
         self.busy = False
         self.tasks = queue.Queue()
         self.active_progress = None
@@ -2534,24 +2749,38 @@ class App:
         self.offset = tk.StringVar(value="0")
         self.density = tk.StringVar(value="6")
         self.render_settings = dict(DM_DEFAULTS)
+        self.saved_offsets = {}
+        self.preferences_readable = True
         rule_warning = ""
+        try:
+            self.render_settings, density, self.saved_offsets = load_preferences()
+            self.density.set(str(density))
+        except (ToolError, OSError) as exc:
+            rule_warning = str(exc)
+            self.preferences_readable = False
+        try:
+            recovered = pending_outputs()
+            self.pending_output = recovered[-1] if recovered else None
+            self.last_output = self.pending_output
+        except (ToolError, OSError) as exc:
+            rule_warning += "\n" + str(exc)
         try:
             self.render_settings["filter_rules"] = load_filter_rules()
         except (ToolError, OSError) as exc:
             self.render_settings["filter_rules"] = default_filter_rules()
-            rule_warning = f"读取已保存的屏蔽规则失败，暂用默认规则；原文件未改动。{exc}"
+            rule_warning += f"\n读取已保存的屏蔽规则失败，暂用默认规则；原文件未改动。{exc}"
         self.platform = tk.StringVar(value="来源待查询")
         self.platform_keys = []
         self.source_status = tk.StringVar(value="选中电影后自动查询各平台，只列出已取得弹幕的可选来源。")
         self.settings_dialog = None
         self.settings_summary = tk.StringVar(value=self.settings_description())
         self.output_text = tk.StringVar(value="输出到：所选影片的原目录")
+        self.result_summary = tk.StringVar()
         style = ttk.Style(root)
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", 17, "bold"))
         style.configure("TLabel", font=("Microsoft YaHei UI", 10))
         style.configure("TButton", padding=(8, 4))
-        p = ttk.Frame(root, padding=12)
-        p.pack(fill="both", expand=True)
+        p, footer = scrollable_window(root, 900, 780)
         head = ttk.Frame(p)
         head.pack(fill="x")
         ttk.Label(head, text="字幕＋弹幕", style="Title.TLabel").pack(side="left")
@@ -2613,16 +2842,26 @@ class App:
         self.settings_button = ttk.Button(row, textvariable=self.settings_summary, command=self.open_settings)
         self.settings_button.pack(side="right")
         ttk.Label(p, textvariable=self.output_text, wraplength=790).pack(anchor="w", pady=(0, 8))
-        row = ttk.Frame(p)
+        row = ttk.Frame(footer)
         row.pack(fill="x")
-        self.generate_button = ttk.Button(row, text="确认合成 → 本机合成后写回影片目录", command=self.generate, state="disabled")
+        self.generate_button = ttk.Button(row, text="确认合成并写回", command=self.generate, state="disabled")
         self.generate_button.pack(side="left", fill="x", expand=True)
         self.retry_copy_button = ttk.Button(row, text="重试写回 NAS", command=self.retry_copy, state="disabled")
         self.retry_copy_button.pack(side="left", padx=(6, 0))
-        self.progress_bar = ttk.Progressbar(p, mode="determinate", maximum=100)
+        self.cancel_button = ttk.Button(row, text="停止等待", command=self.cancel_task, state="disabled")
+        self.cancel_button.pack(side="left", padx=(6, 0))
+        row = ttk.Frame(footer)
+        row.pack(fill="x", pady=(4, 0))
+        self.open_output_button = ttk.Button(row, text="打开成品文件夹", command=self.open_output, state="disabled")
+        self.open_output_button.pack(side="left")
+        self.copy_path_button = ttk.Button(row, text="复制成品路径", command=self.copy_output_path, state="disabled")
+        self.copy_path_button.pack(side="left", padx=6)
+        ttk.Button(row, text="待写回任务…", command=self.choose_pending).pack(side="right")
+        self.progress_bar = ttk.Progressbar(footer, mode="determinate", maximum=100)
         self.progress_bar.pack(fill="x", pady=(6, 6))
-        ttk.Label(p, textvariable=self.status, wraplength=790).pack(anchor="w")
-        ttk.Label(p, textvariable=self.progress_text, foreground="#606975", wraplength=790).pack(anchor="w")
+        wrapped_label(footer, textvariable=self.result_summary)
+        wrapped_label(footer, textvariable=self.status)
+        wrapped_label(footer, textvariable=self.progress_text, foreground="#606975")
         log_frame = ttk.Frame(p)
         log_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.log_box = tk.Text(log_frame, height=4, wrap="word", state="disabled", font=("Microsoft YaHei UI", 9))
@@ -2631,6 +2870,11 @@ class App:
         self.log_box.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         self.root.after(100, self.poll)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        if self.pending_output:
+            self.output_text.set("已恢复待写回成品：" + self.pending_output["local_output"])
+            self.status.set("上次的本机成品已保留，可重试写回，或在“待写回任务”中选择其他成品。")
+        self.update_ready()
         if rule_warning:
             self.status.set(rule_warning)
             self.log(rule_warning)
@@ -2702,27 +2946,90 @@ class App:
         self.update_ready()
 
     def update_ready(self):
-        ready = not self.busy and self.result is not None and bool(self.result.subtitles) and bool(self.result.comments or self.result.dm_ass)
+        ready = (not self.busy or self.cancellable) and self.result is not None and bool(self.result.subtitles) and bool(self.result.comments or self.result.dm_ass)
         self.generate_button.configure(state="normal" if ready else "disabled")
+        self.generate_button.configure(text="使用已取得结果合成" if self.busy and self.cancellable and ready else "确认合成并写回")
+        self.cancel_button.configure(state="normal" if self.busy and self.cancellable else "disabled")
+        self.open_output_button.configure(state="normal" if self.last_output else "disabled")
+        self.copy_path_button.configure(state="normal" if self.last_output else "disabled")
         self.retry_copy_button.configure(state="normal" if not self.busy and self.pending_output else "disabled")
         has_platforms = self.result is not None and bool(self.result.movies) and self.movie_box.current() >= 0
         self.platform_box.configure(state="readonly" if not self.busy and has_platforms and self.platform_keys else "disabled")
         self.retry_sources_button.configure(state="normal" if not self.busy and has_platforms else "disabled")
         self.settings_button.configure(state="disabled" if self.busy or (self.result and self.result.dm_ass) else "normal")
 
-    def background(self, work, done):
+    def background(self, work, done, *, cancellable=False):
         if self.busy:
             return
+        self.task_id += 1
+        ticket = self.task_id
+        event = self.cancel_event = threading.Event()
+        self.cancellable = cancellable
         self.set_busy(True)
         def run():
+            self.task_local.context = (ticket, event)
             try:
-                self.tasks.put(("done", done, work()))
+                value = work()
+                if not event.is_set():
+                    self.tasks.put(("done", done, value, ticket))
+            except TaskCancelled:
+                pass
             except Exception as exc:
-                self.tasks.put(("error", str(exc), None))
+                if not event.is_set():
+                    self.tasks.put(("error", str(exc), None, ticket))
         threading.Thread(target=run, daemon=True).start()
 
     def progress(self, message):
-        self.tasks.put(("progress", message, None))
+        self.progress_callback()(message)
+
+    def progress_callback(self):
+        ticket, event = getattr(self.task_local, "context", (self.task_id, self.cancel_event))
+        def callback(message):
+            if event.is_set():
+                raise TaskCancelled()
+            self.tasks.put(("progress", message, None, ticket))
+        return callback
+
+    def snapshot_callback(self, done):
+        ticket, event = self.task_local.context
+        def callback(result):
+            if event.is_set():
+                raise TaskCancelled()
+            self.tasks.put(("snapshot", done, copy.deepcopy(result), ticket))
+        return callback
+
+    def cancel_task(self):
+        if not self.busy or not self.cancellable:
+            return
+        self.cancel_event.set()
+        self.task_id += 1
+        self.cancellable = False
+        self.set_busy(False)
+        self.progress_bar["value"] = 0
+        self.progress_text.set("已停止等待；已取得的结果保留，尚在连接的请求将在超时后结束。")
+        self.status.set("可以使用已有结果、补选文件，或重试未完成的来源。")
+        self.refresh_platforms()
+
+    def save_current_preferences(self):
+        if not self.preferences_readable:
+            raise ToolError("原显示设置读取失败，未覆盖原文件；请在弹幕设置中核对并应用后再保存。")
+        offsets = dict(self.saved_offsets)
+        if self.result:
+            offsets[video_preference_key(self.result.video)] = finite(self.offset.get(), "弹幕偏移")
+        store_preferences(self.render_settings, int(self.density.get()), offsets)
+        self.saved_offsets = offsets
+
+    def close(self):
+        if self.busy and not self.cancellable:
+            messagebox.showinfo("正在处理", "请等待本次合成或写回完成后关闭，避免中断成品保存。", parent=self.root)
+            return
+        try:
+            self.save_current_preferences()
+        except (ToolError, ValueError, OSError) as exc:
+            if not messagebox.askyesno("设置未保存", str(exc) + "\n仍然关闭吗？", parent=self.root):
+                return
+        self.cancel_event.set()
+        self.root.destroy()
 
     def apply_progress(self, update):
         if isinstance(update, str):
@@ -2742,9 +3049,15 @@ class App:
     def poll(self):
         try:
             while True:
-                kind, first, second = self.tasks.get_nowait()
+                item = self.tasks.get_nowait()
+                kind, first, second = item[:3]
+                if len(item) > 3 and item[3] != self.task_id:
+                    continue
                 if kind == "progress":
                     self.apply_progress(first)
+                elif kind == "snapshot":
+                    first(second)
+                    self.update_ready()
                 elif kind == "error":
                     if self.result is None:
                         self.subtitle.set("识别未完成，请检查路径后重试")
@@ -2774,9 +3087,15 @@ class App:
         path = self.path.get().strip().strip('"')
         if not path:
             return self.browse()
+        try:
+            self.save_current_preferences()
+        except (ToolError, ValueError, OSError) as exc:
+            self.log("设置未保存：" + str(exc))
         title = self.title.get() if override else ""
         self.result = None
-        self.pending_output = None
+        self.last_output = None
+        self.result_summary.set("")
+        self.offset.set(str(self.saved_offsets.get(video_preference_key(path), 0)))
         self.sub_box.configure(values=[])
         self.movie_box.configure(values=[])
         self.platform_keys = []
@@ -2787,7 +3106,7 @@ class App:
         self.movie.set("正在查找…")
         self.dm_text.set("正在获取…")
         self.update_ready()
-        def done(result):
+        def done(result, final=True):
             self.result = result
             self.path.set(str(result.video))
             self.title.set(result.identity["title"])
@@ -2807,11 +3126,17 @@ class App:
             self.refresh_platforms()
             self.show_danmaku()
             self.output_text.set("输出到：" + str(result.video.with_name(f"弹幕版-{result.video.stem}.ass")))
-            for warning in result.warnings:
-                self.log("提示：" + warning)
-            self.log("本地缓存：" + str(result.workspace))
-            self.status.set("已找到字幕和弹幕，请核对后确认合成。" if result.subtitles and (result.comments or result.dm_ass) else "识别结束，仍有缺失项，请查看提示。")
-        self.background(lambda: scan_movie(path, title, self.progress), done)
+            if final:
+                for warning in result.warnings:
+                    self.log("提示：" + warning)
+                self.log("本地缓存：" + str(result.workspace))
+                self.status.set("已找到字幕和弹幕，请核对后确认合成。" if result.subtitles and (result.comments or result.dm_ass) else "识别结束，仍有缺失项，请查看提示。")
+            else:
+                self.status.set("已取得可用结果，可直接合成或继续等待其他来源。" if result.subtitles and result.comments else "正在查询；已取得的结果会陆续显示。")
+        def work():
+            return scan_movie(path, title, self.progress_callback(),
+                              on_update=self.snapshot_callback(lambda result: done(result, False)))
+        self.background(work, done, cancellable=True)
 
     def show_danmaku(self):
         r = self.result
@@ -2842,6 +3167,8 @@ class App:
         else:
             self.platform.set("请选择已取得的来源" if available else "未取得可用来源" if options is not None else "来源待查询")
         summary = source_summary(options) if movie else "未匹配到电影来源，可修正片名或手动补选弹幕。"
+        if r and r.source_pending:
+            summary += ("；查询中：" if self.busy else "；待重试：") + "、".join(PLATFORMS[key] for key in r.source_pending)
         self.source_status.set(summary + ("；未取得的原因见下方日志。" if any(not option.available for option in options or []) else ""))
 
     def change_platform(self, _=None):
@@ -2869,10 +3196,15 @@ class App:
         keep_manual = retry_failed and r.danmaku_source.startswith("手动补选") and bool(r.comments or r.dm_ass)
         if not retry_failed:
             clear_selected_danmaku(r)
+            r.source_pending = [platform for platform in PLATFORMS if platform in movie["links"] and
+                                not any(row.platform == platform for row in r.source_catalog.get(key, []))]
         self.refresh_platforms()
         self.show_danmaku()
         self.update_ready()
-        def done(options):
+        def done(updated, final=True):
+            r = updated
+            self.result = r
+            options = r.source_catalog.get(key, [])
             if any(option.available for option in options) and not keep_manual:
                 preferred = previous_platform if any(option.available and option.platform == previous_platform for option in options) else None
                 select_danmaku_source(r, movie, preferred)
@@ -2883,15 +3215,21 @@ class App:
             self.refresh_platforms()
             self.show_danmaku()
             for option in options:
-                if not option.available:
+                if final and not option.available:
                     self.log(f"{PLATFORMS[option.platform]}未取得弹幕：{option.error}")
             self.status.set("已列出弹幕来源与条数，切换直接使用本机缓存。" if any(option.available for option in options)
                             else "当前候选未取得在线弹幕，可重查来源、换候选或补选文件。")
             self.update_ready()
         if key in r.source_catalog and not retry_failed:
-            done(r.source_catalog[key])
+            done(r)
         else:
-            self.background(lambda: discover_danmaku_sources(r, movie, self.progress, retry_failed=retry_failed), done)
+            working = copy.deepcopy(r)
+            def work():
+                notify = self.snapshot_callback(lambda result: done(result, False))
+                discover_danmaku_sources(working, movie, self.progress_callback(), retry_failed=retry_failed,
+                                         on_update=lambda _: notify(working))
+                return working
+            self.background(work, done, cancellable=True)
 
     def retry_sources(self):
         self.change_movie(retry_failed=True)
@@ -2911,44 +3249,59 @@ class App:
         self.update_ready()
 
     def pick_subtitle(self):
+        if self.busy:
+            return
         if not self.result:
             return messagebox.showinfo("先选影片", "先选择影片并完成识别，再补选字幕。")
         path = filedialog.askopenfilename(title="补选原台词字幕", filetypes=[("文字字幕", "*.srt *.ass")])
         if path:
-            try:
-                if self.result.workspace is None:
-                    self.result.workspace = local_workspace()
+            r = self.result
+            def work():
+                self.progress("正在后台读取并缓存字幕…")
+                folder = r.workspace or local_workspace()
                 choice = SubtitleChoice("手动补选 · " + Path(path).name, "file", 999, path)
-                self.result.subtitles.insert(0, cache_subtitle(choice, self.result.workspace))
-                self.sub_box.configure(values=[c.label for c in self.result.subtitles])
+                return cache_subtitle(choice, folder), folder
+            def done(value):
+                choice, r.workspace = value
+                r.subtitles.insert(0, choice)
+                self.sub_box.configure(values=[c.label for c in r.subtitles])
                 self.sub_box.current(0)
+                self.status.set("字幕已导入并缓存，可以合成。")
                 self.update_ready()
-            except Exception as exc:
-                messagebox.showerror("字幕不可用", str(exc))
+            self.background(work, done)
 
     def pick_danmaku(self):
+        if self.busy:
+            return
         if not self.result:
             return messagebox.showinfo("先选影片", "先选择影片并完成识别，再补选弹幕。")
         path = filedialog.askopenfilename(title="补选弹幕文件", filetypes=[("弹幕", "*.json *.xml *.ass")])
         if path:
-            try:
+            staged = dataclass_replace(self.result)
+            def work():
+                self.progress("正在后台读取并缓存弹幕…")
                 if Path(path).suffix.lower() == ".ass":
-                    self.result.dm_ass = parse_ass(read_text(path))
-                    self.result.comments = []
+                    staged.dm_ass = parse_ass(read_text(path))
+                    staged.comments = []
                 else:
-                    self.result.comments, _ = parse_comments(read_text(path))
-                    self.result.dm_ass = None
-                self.result.danmaku_source = "手动补选 · " + Path(path).name
-                self.result.danmaku_url = ""
-                self.result.selected_movie_key, self.result.selected_platform = None, ""
-                cache_danmaku(self.result)
+                    staged.comments, _ = parse_comments(read_text(path))
+                    staged.dm_ass = None
+                staged.danmaku_source = "手动补选 · " + Path(path).name
+                staged.danmaku_url = ""
+                staged.selected_movie_key, staged.selected_platform = None, ""
+                cache_danmaku(staged)
+                return staged
+            def done(result):
+                self.result = result
                 self.platform.set("手动导入")
                 self.show_danmaku()
+                self.status.set("弹幕已导入并缓存，可以合成。")
                 self.update_ready()
-            except Exception as exc:
-                messagebox.showerror("弹幕不可用", str(exc))
+            self.background(work, done)
 
     def generate(self):
+        if self.busy and self.cancellable and self.result and self.result.subtitles and (self.result.comments or self.result.dm_ass):
+            self.cancel_task()
         r = self.result
         if self.busy or r is None:
             return
@@ -2958,14 +3311,26 @@ class App:
                 raise ToolError("路径已经改变，请点击“识别”重新读取后再合成。")
             index = self.sub_box.current()
             offset, density = finite(self.offset.get()), int(self.density.get())
+            self.save_current_preferences()
         except (ToolError, ValueError, OSError) as exc:
             return messagebox.showerror("请检查输入", str(exc))
         settings = dict(self.render_settings)
         self.background(lambda: synthesize(r, index, offset, density, progress=self.progress, **settings), self.show_output)
 
     def show_output(self, value):
+        self.last_output = value
         self.log(f"台词 {value['subtitle_lines']} 行，弹幕 {value['danmaku_lines']} 条；过滤/去重/限流 {value['filtered']} 条。")
         self.log(f"其中内置规则屏蔽 {value.get('noise_filtered', 0)} 条，自定义规则屏蔽 {value.get('keyword_filtered', 0)} 条。")
+        stats = value.get("filter_stats", {})
+        summary = (f"原始 {value.get('raw_count', value['danmaku_lines'] + value['filtered']):,} 条 → "
+                   f"最终 {value['danmaku_lines']:,} 条；类型屏蔽 {stats.get('types', 0):,}、"
+                   f"规则屏蔽 {stats.get('noise', 0) + stats.get('keywords', 0):,}、"
+                   f"重复 {stats.get('duplicates', 0):,}、密度/空间限制 {stats.get('density', 0):,}、"
+                   f"时间范围外 {stats.get('time', 0):,}。")
+        self.result_summary.set(summary)
+        self.log(summary)
+        if value.get("recovery_warning"):
+            self.log(value["recovery_warning"])
         if value.get("saved", True):
             self.pending_output = None
             self.status.set("合成完成，已保存到影片原目录。")
@@ -2981,6 +3346,63 @@ class App:
             messagebox.showwarning("本地完成，等待写回", "合成字幕已保存在电脑：\n" + value["local_output"] +
                                    "\n\n" + value["write_error"] + "\n\n恢复 NAS 连接后点“重试写回 NAS”，无需重新下载或合成。")
         self.update_ready()
+
+    def output_path(self):
+        if not self.last_output:
+            return ""
+        return self.last_output.get("output", self.last_output["local_output"]) if self.last_output.get("saved") else self.last_output["local_output"]
+
+    def copy_output_path(self):
+        path = self.output_path()
+        if path:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(path)
+            self.status.set("成品路径已复制。")
+
+    def open_output(self):
+        path = self.output_path()
+        if path:
+            try:
+                if os.name == "nt":
+                    subprocess.Popen(["explorer.exe", "/select,", path])
+                else:
+                    webbrowser.open(Path(path).parent.as_uri())
+            except OSError as exc:
+                self.status.set("打开文件夹失败，可复制路径手动打开：" + str(exc))
+
+    def choose_pending(self):
+        if self.busy:
+            return
+        try:
+            rows = pending_outputs()
+        except (ToolError, OSError) as exc:
+            return messagebox.showerror("无法读取待写回任务", str(exc), parent=self.root)
+        if not rows:
+            return messagebox.showinfo("待写回任务", "没有尚未写回的成品。", parent=self.root)
+        win = tk.Toplevel(self.root)
+        win.title("恢复待写回成品")
+        body, footer = scrollable_window(win, 700, 360)
+        ttk.Label(body, text="选择已有成品后重试写回，不重新下载或合成。", wraplength=620).pack(anchor="w")
+        choices = ttk.Combobox(body, state="readonly", values=[Path(row["local_output"]).name + " · " + str(i + 1) for i, row in enumerate(rows)])
+        choices.pack(fill="x", pady=8)
+        detail = tk.StringVar()
+        ttk.Label(body, textvariable=detail, wraplength=620).pack(anchor="w")
+        def describe(_=None):
+            row = rows[choices.current()]
+            detail.set("本机：" + row["local_output"] + "\n目标：" + row["target"] + "\n" + row.get("write_error", ""))
+        def select():
+            if self.busy:
+                return
+            self.pending_output = self.last_output = rows[choices.current()]
+            self.output_text.set("待写回成品：" + self.pending_output["local_output"])
+            self.status.set("已恢复成品，点“重试写回 NAS”即可。")
+            self.update_ready()
+            win.destroy()
+        choices.bind("<<ComboboxSelected>>", describe)
+        choices.current(len(rows) - 1)
+        describe()
+        ttk.Button(footer, text="恢复这个任务", command=select).pack(side="right")
+        ttk.Button(footer, text="关闭", command=win.destroy).pack(side="right", padx=6)
 
     def retry_copy(self):
         if not self.busy and self.pending_output:

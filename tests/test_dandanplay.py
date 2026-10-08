@@ -189,3 +189,77 @@ class DandanplayTests(unittest.TestCase):
             retried = d.dandan_request('/api/v2/comment/123')
         self.assertEqual(network.call_count, 2)
         self.assertEqual(retried['count'], 1)
+
+    def test_movie_catalog_search_finds_truman_and_keeps_large_episode_id(self):
+        catalog = {'animes': [{'animeTitle': '楚门的世界', 'bangumiId': 'tmdb-movie-37165', 'startDate': '1998-06-04'}]}
+        detail = {'bangumi': {'animeTitle': '楚门的世界', 'titles': [{'title': 'The Truman Show'}],
+                             'episodes': [{'episodeId': 1000371650001, 'episodeTitle': '楚门的世界'}]}}
+        for title in ('楚门的世界', 'The Truman Show', '楚门的世界 The Truman Show'):
+            with self.subTest(title=title), patch.object(d, 'dandan_request', side_effect=[catalog, detail]) as request:
+                movies = d.dandan_search(title, year='1998')
+                self.assertEqual(len(movies), 1)
+                self.assertEqual(movies[0]['title'], '楚门的世界')
+                self.assertEqual(movies[0]['year'], '1998')
+                self.assertTrue(movies[0]['links']['dandanplay'].endswith('/1000371650001'))
+                self.assertFalse(movies[0]['official_exact'])
+                self.assertFalse(movies[0]['official_confirm'])
+                self.assertEqual(request.call_count, 2)
+                self.assertTrue(request.call_args_list[0].args[0].startswith('/api/v2/search/tmdb?keyword='))
+                self.assertEqual(request.call_args_list[1].args[0], '/api/v2/bangumi/tmdb-movie-37165')
+
+    def test_movie_search_skips_tv_wrong_year_and_unsafe_detail_ids(self):
+        catalog = {'animes': [
+            {'bangumiId': 'tmdb-tv-1', 'animeTitle': '电影', 'startDate': '1998-01-01'},
+            {'bangumiId': 'tmdb-movie-1', 'animeTitle': '电影', 'startDate': '2020-01-01'},
+            {'bangumiId': 'tmdb-movie-2/../login', 'animeTitle': '电影', 'startDate': '1998-01-01'}]}
+        with patch.object(d, 'dandan_request', side_effect=[catalog, {'animes': []}]) as request:
+            self.assertEqual(d.dandan_search('电影', year='1998'), [])
+        self.assertEqual(request.call_count, 2)
+        self.assertTrue(request.call_args_list[1].args[0].startswith('/api/v2/search/episodes?'))
+
+    def test_movie_search_limits_details_and_rejects_unrelated_titles(self):
+        catalog = {'animes': [{'animeTitle': '不相关', 'bangumiId': f'tmdb-movie-{i}'} for i in range(1, 8)]}
+        detail = {'bangumi': {'animeTitle': '不相关动画', 'episodes': [{'episodeId': 123}]}}
+        with patch.object(d, 'dandan_request', side_effect=[catalog, detail, detail, detail, {'animes': []}]) as request:
+            self.assertEqual(d.dandan_search('楚门的世界'), [])
+        self.assertEqual(request.call_count, 5)
+
+    def test_movie_catalog_failure_can_fall_back_to_episode_search(self):
+        episodes = {'animes': [{'animeTitle': '动画电影', 'episodes': [{'episodeId': 123}]}]}
+        with patch.object(d, 'dandan_request', side_effect=[d.ToolError('暂时断线'), episodes]):
+            movies = d.dandan_search('动画电影')
+        self.assertEqual(movies[0]['official_title'], '动画电影')
+
+    def test_movie_catalog_failure_is_not_reported_as_no_match(self):
+        with patch.object(d, 'dandan_request', side_effect=[d.ToolError('暂时断线'), {'animes': []}]):
+            with self.assertRaisesRegex(d.ToolError, '电影搜索未完成'):
+                d.dandan_search('楚门的世界')
+
+    def test_documented_movie_routes_are_signed_but_arbitrary_routes_are_rejected(self):
+        with patch.object(d, 'dandan_config', return_value=self.config), \
+                patch.object(d, 'web_bytes', return_value=b'{"success":true}') as network:
+            for path in ('/api/v2/search/tmdb?keyword=movie', '/api/v2/bangumi/tmdb-movie-37165'):
+                d.dandan_request(path)
+            for path in ('/api/v2/bangumi/../login', '/api/v2/bangumi/tmdb-movie-37165/send'):
+                with self.assertRaises(d.ToolError):
+                    d.dandan_request(path)
+        self.assertEqual(network.call_count, 2)
+        self.assertIn('X-Signature', network.call_args.kwargs['request_headers'])
+
+    def test_file_match_failure_still_queries_movie_title(self):
+        video = self.folder / '楚门的世界.1998.mkv'
+        video.write_bytes(b'video')
+        movies = d.dandan_movies({'animes': [{'animeTitle': '楚门的世界', 'year': '1998',
+            'episodes': [{'episodeId': 1000371650001}]}]}, search=True)
+        with patch.object(d, 'dandan_config', return_value=self.config), \
+                patch.object(d, 'inspect_video', return_value={}), \
+                patch.object(d, 'discover_subtitles', return_value=([], [])), \
+                patch.object(d, 'search_movies', return_value=[]), \
+                patch.object(d, 'dandan_match', side_effect=d.ToolError('暂时断线')), \
+                patch.object(d, 'dandan_search', return_value=movies) as search, \
+                patch.object(d, 'discover_danmaku_sources', return_value=[]):
+            result = d.scan_movie(video)
+        self.assertEqual(search.call_args.args[0], '楚门的世界')
+        self.assertEqual(search.call_args.args[2], '1998')
+        self.assertEqual(result.movies[0]['title'], '楚门的世界')
+        self.assertTrue(any('继续按片名查询' in warning for warning in result.warnings))

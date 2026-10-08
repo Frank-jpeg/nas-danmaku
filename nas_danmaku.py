@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.8.0"
+VERSION = "2.8.1"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -1076,7 +1076,8 @@ NAS 写回失败会保留本机成品和待写回记录，重启后可恢复；�
 “来源”只列出已取得并缓存的弹幕，切换直接用本机缓存。未取得的来源单独标注，详细原因见日志。
 “重查来源”重试未取得、未完成及部分取得的项目，保留完整成功来源；补取失败仍保留原数据。
 官方接入：顶部“弹弹play接入”填写 AppId/AppSecret 后保存并验证；密钥仅在本机加密保存。
-启用后优先匹配文件前 16 MB 的 MD5，官方候选进入电影列表；按片名重查走官方搜索。
+启用后优先匹配文件前 16 MB 的 MD5；匹配失败继续按片名搜索，官方候选进入电影列表。
+片名搜索优先查询官方 TMDB 电影目录及详情，按年份和中英文别名核对，未命中再查节目目录。
 模糊候选会核对片名；多个官方候选需在列表中选择具体电影或剧集，不会默认使用第一集。
 官方弹幕含关联弹幕，已应用服务返回的匹配偏移；下方偏移用于额外调整。
 匹配/搜索缓存 2 小时，弹幕缓存 6 小时；可停用官方来源。
@@ -1227,9 +1228,10 @@ def dandan_headers(app_id, secret, path, timestamp=None):
 
 
 def dandan_request(path, payload=None, progress=None, *, use_cache=True):
-    # Only the three approved public read/matching APIs can be called from this client.
+    # Only documented public catalog, matching and comment routes are used.
     route = urllib.parse.urlsplit(path).path
-    if route not in {"/api/v2/match", "/api/v2/search/episodes"} and not re.fullmatch(r"/api/v2/comment/[1-9]\d*", route):
+    if route not in {"/api/v2/match", "/api/v2/search/episodes", "/api/v2/search/tmdb"} and not re.fullmatch(
+            r"/api/v2/(?:comment/[1-9]\d*|bangumi/tmdb-movie-[1-9]\d*)", route):
         raise ToolError("不支持的弹弹play接口。")
     config = dandan_config()
     if not config["enabled"] or not config["app_id"] or not config["secret"]:
@@ -1285,7 +1287,8 @@ def dandan_movies(data, search=False):
     if search:
         for anime in data.get("animes") or []:
             for episode in anime.get("episodes") or []:
-                rows.append(dict(episode, animeTitle=anime.get("animeTitle", "")))
+                rows.append(dict(episode, animeTitle=anime.get("animeTitle", ""), year=anime.get("year", ""),
+                                 official_aliases=anime.get("official_aliases", [])))
     else:
         rows = data.get("matches") or []
     movies, seen = [], set()
@@ -1297,9 +1300,11 @@ def dandan_movies(data, search=False):
             title = str(row.get("animeTitle") or "未命名作品")
             episode = str(row.get("episodeTitle") or "")
             seen.add(episode_id)
-            movies.append(dict(title=title + (" · " + episode if episode else ""), year="", duration="",
+            movies.append(dict(title=title + (" · " + episode if episode and episode != title else ""),
+                               year=str(row.get("year") or ""), duration="",
                                links={"dandanplay": f"https://api.dandanplay.net/api/v2/comment/{episode_id}"},
                                official_title=title, official_shift=finite(row.get("shift", 0)),
+                               official_aliases=row.get("official_aliases", []),
                                official_exact=bool(data.get("isMatched")) and not search))
         except (ValueError, TypeError, KeyError, ToolError):
             continue
@@ -1326,20 +1331,66 @@ def dandan_match(video, meta, progress=None):
     return dandan_movies(dandan_request("/api/v2/match", payload, progress))
 
 
-def dandan_search(title, progress=None):
+def dandan_tmdb_search(title, progress=None, year=""):
+    """Movie catalog entries need their detail route to obtain real episode IDs."""
+    query = title.strip()
+    bilingual = re.match(r"^([\u4e00-\u9fff][^A-Za-z]*?)\s+[A-Za-z]", query)
+    if bilingual:
+        query = bilingual.group(1).strip()
+    data = dandan_request("/api/v2/search/tmdb?" + urllib.parse.urlencode({"keyword": query}), progress=progress)
+    animes, failures, attempted, seen = [], [], 0, set()
+    for row in data.get("animes") or []:
+        bangumi_id = str(row.get("bangumiId") or "")
+        if not re.fullmatch(r"tmdb-movie-[1-9]\d*", bangumi_id) or bangumi_id in seen:
+            continue
+        seen.add(bangumi_id)
+        found_year = str(row.get("startDate") or "")[:4]
+        if year and found_year and str(year) != found_year:
+            continue
+        if attempted >= 3:
+            report(progress, "电影候选较多，请填写更具体的片名缩小范围")
+            break
+        attempted += 1
+        try:
+            response = dandan_request("/api/v2/bangumi/" + bangumi_id, progress=progress)
+            detail = response.get("bangumi") or {}
+            animes.append(dict(animeTitle=detail.get("animeTitle") or row.get("animeTitle", ""),
+                               year=found_year, episodes=detail.get("episodes") or [],
+                               official_aliases=[item.get("title", "") for item in detail.get("titles") or []]))
+        except (ToolError, OSError) as exc:
+            failures.append(str(exc))
+            report(progress, "弹弹play电影详情未取得：" + str(exc))
+    candidates = dandan_candidates(dandan_movies({"animes": animes}, search=True), title, year)
+    if not candidates and failures:
+        raise ToolError("弹弹play电影详情查询未完成：" + failures[0])
+    return candidates
+
+
+def dandan_search(title, progress=None, year=""):
     if len(title.strip()) < 2:
         raise ToolError("搜索片名至少需要两个字符。")
+    movie_error = None
+    try:
+        movies = dandan_tmdb_search(title, progress, year)
+        if movies:
+            return movies
+    except (ToolError, OSError) as exc:
+        movie_error = exc
+        report(progress, "弹弹play电影目录暂不可用，继续节目搜索：" + str(exc))
     data = dandan_request("/api/v2/search/episodes?" + urllib.parse.urlencode({"anime": title.strip(), "v2": "true"}), progress=progress)
     if data.get("hasMore"):
         report(progress, "弹弹play结果较多，请填写更具体的片名或集数缩小范围")
-    return dandan_movies(data, search=True)
+    movies = dandan_candidates(dandan_movies(data, search=True), title, year)
+    if not movies and movie_error:
+        raise ToolError("弹弹play电影搜索未完成：" + str(movie_error))
+    return movies
 
 
 def normalize_title(text):
     return "".join(c for c in unicodedata.normalize("NFKC", html.unescape(str(text))).casefold() if c.isalnum())
 
 
-def dandan_candidates(movies, title):
+def dandan_candidates(movies, title, year=""):
     """Keep exact file matches and plausible titles; multiple episodes need a choice."""
     queries = [normalize_title(title)]
     bilingual = re.match(r"^([\u4e00-\u9fff][^A-Za-z]*?)\s+[A-Za-z]", title)
@@ -1347,9 +1398,12 @@ def dandan_candidates(movies, title):
         queries.append(normalize_title(bilingual.group(1)))
     candidates = []
     for movie in movies:
-        found = normalize_title(movie.get("official_title", movie["title"]))
+        if not movie.get("official_exact") and year and movie.get("year") and str(year) != str(movie["year"]):
+            continue
+        titles = [movie.get("official_title", movie["title"])] + list(movie.get("official_aliases") or [])
         if movie.get("official_exact") or any(query and
-                difflib.SequenceMatcher(None, found, query).ratio() >= .72 for query in queries):
+                difflib.SequenceMatcher(None, normalize_title(found), query).ratio() >= .72
+                for query in queries for found in titles):
             candidates.append(dict(movie))
     for movie in candidates:
         movie["official_confirm"] = not movie.get("official_exact") and len(candidates) > 1
@@ -2342,10 +2396,14 @@ def scan_movie(video, override="", progress=lambda _: None, on_update=None):
         official, notices = [], []
         try:
             if dandan_config()["enabled"]:
-                official = dandan_candidates(
-                    dandan_search(identity["title"], progress) if override else dandan_match(video, meta, progress), identity["title"])
-                if not official and not override:
-                    official = dandan_candidates(dandan_search(identity["title"], progress), identity["title"])
+                if not override:
+                    try:
+                        official = dandan_candidates(dandan_match(video, meta, progress), identity["title"], identity["year"])
+                    except (ToolError, OSError) as exc:
+                        notices.append("弹弹play文件匹配未完成，继续按片名查询：" + str(exc))
+                if not official:
+                    official = dandan_candidates(dandan_search(identity["title"], progress, identity["year"]),
+                                                 identity["title"], identity["year"])
                 if not official:
                     notices.append("弹弹play未找到片名相符的节目，已继续查询其他来源。")
                 elif any(movie.get("official_confirm") for movie in official):
@@ -3166,13 +3224,13 @@ class App:
             def work():
                 save_dandan_config(*values)
                 if values[2]:
-                    response = dandan_request("/api/v2/search/episodes?" + urllib.parse.urlencode({"anime": title, "v2": "true"}),
+                    response = dandan_request("/api/v2/search/tmdb?" + urllib.parse.urlencode({"keyword": title}),
                                               progress=self.progress, use_cache=False)
-                    return len(dandan_movies(response, search=True))
+                    return len(response.get("animes") or [])
                 return None
             def done(count):
                 if win.winfo_exists():
-                    note.set("官方来源已停用。" if count is None else f"官方接口验证成功，返回 {count} 个节目。重新识别影片即可使用。")
+                    note.set("官方来源已停用。" if count is None else f"官方接口验证成功，返回 {count} 部作品。重新识别影片即可使用。")
                     save_button.configure(state="normal")
                 self.status.set("弹弹play官方接口已验证，可重新识别影片。" if count is not None else "弹弹play官方来源已停用。")
             def safe_work():

@@ -28,7 +28,8 @@ class IsolatedResult(unittest.TextTestResult):
     def startTest(self, test):
         self.context = contextlib.ExitStack()
         folder = self.context.enter_context(tempfile.TemporaryDirectory())
-        self.context.enter_context(patch.dict(os.environ, {'LOCALAPPDATA': folder}))
+        self.context.enter_context(patch.dict(os.environ, {'LOCALAPPDATA': folder,
+            'DANDANPLAY_APP_ID': '', 'DANDANPLAY_APP_SECRET': ''}))
         self.context.enter_context(patch.object(d, 'local_backup_folder', return_value=Path(folder) / 'backups'))
         super().startTest(test)
 

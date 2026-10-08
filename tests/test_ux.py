@@ -257,6 +257,41 @@ class UXGuiTests(UXFixture, unittest.TestCase):
         self.assertIs(footer.master, top)
         top.destroy()
 
+    def test_dandan_dialog_keeps_disabled_setting_and_never_prefills_secret(self):
+        d.save_local_json('dandanplay.local.json', dict(version=1, app_id='testapp', enabled=False, protected_secret='encrypted'))
+        self.app.open_dandan_settings()
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        widgets = list(descendants(self.app.dandan_dialog))
+        entries = [w for w in widgets if isinstance(w, d.ttk.Entry)]
+        self.assertEqual(entries[0].get(), 'testapp')
+        self.assertEqual(entries[1].get(), '')
+        self.assertTrue(entries[1].cget('show'))
+        enabled = next(w for w in widgets if isinstance(w, d.ttk.Checkbutton))
+        self.assertFalse(enabled.instate(['selected']))
+
+    def test_multiple_official_episodes_stay_unselected_until_user_chooses(self):
+        video = self.folder / '电影.mkv'
+        video.write_bytes(b'video')
+        self.app.path.set(str(video))
+        movies = d.dandan_candidates(d.dandan_movies({'animes': [{'animeTitle': '电影', 'episodes': [
+            {'episodeId': 1}, {'episodeId': 2}]}]}, search=True), '电影')
+        result = d.ScanResult(video, dict(title='电影', year='', source='文件名'), {}, d.file_signature(video),
+                              movies=movies, workspace=self.folder)
+        with patch.object(d, 'scan_movie', return_value=result):
+            self.app.scan()
+            self.wait()
+        self.assertEqual(self.app.movie_box.current(), -1)
+        self.assertIn('选择具体', self.app.source_status.get())
+        self.app.movie_box.current(1)
+        with patch.object(d, 'fetch_public_danmaku', return_value=([d.Comment(1, '第二集')], '官方', 'url')):
+            self.app.change_movie()
+            self.wait()
+        self.assertEqual(self.app.result.comments[0].text, '第二集')
+        self.assertEqual(self.app.result.selected_movie_key, d.movie_source_key(movies[1]))
+
 
 if __name__ == '__main__':
     unittest.main()

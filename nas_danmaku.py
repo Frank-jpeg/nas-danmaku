@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -1041,6 +1041,7 @@ import gzip
 import queue
 import threading
 LOCAL_STATE_LOCK = threading.Lock()
+DANDAN_REQUEST_LOCK = threading.Lock()
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -1050,6 +1051,7 @@ SHOOTER_API = "https://www.shooter.cn/api/subapi.php"
 THUNDER_SUBTITLE_API = "https://api-shoulei-ssl.xunlei.com/oracle/subtitle"
 KAN_SEARCH = "https://api.so.360kan.com/index"
 PLATFORMS = {"qq": "腾讯视频", "qiyi": "爱奇艺", "bilibili1": "哔哩哔哩", "youku": "优酷", "imgo": "芒果TV"}
+PLATFORM_NAMES = dict(PLATFORMS, dandanplay="弹弹play开放弹幕网络")
 HOSTS = ("qq.com", "iqiyi.com", "bilibili.com", "youku.com", "mgtv.com")
 HELP = "字幕弹幕一键合成 v" + VERSION + """（单文件）
 
@@ -1073,10 +1075,15 @@ NAS 写回失败会保留本机成品和待写回记录，重启后可恢复；�
 选中电影后，自动核实其已找到链接的各个平台，显示来源和实际取得的原始弹幕条数。
 “来源”只列出已取得并缓存的弹幕，切换直接用本机缓存。未取得的来源单独标注，详细原因见日志。
 “重查来源”重试未取得、未完成及部分取得的项目，保留完整成功来源；补取失败仍保留原数据。
-公开服务： https://dmku.hls.one/ ；备用 https://danmu.zxz.ee/ 。
+官方接入：顶部“弹弹play接入”填写 AppId/AppSecret 后保存并验证；密钥仅在本机加密保存。
+启用后优先匹配文件前 16 MB 的 MD5，官方候选进入电影列表；按片名重查走官方搜索。
+模糊候选会核对片名；多个官方候选需在列表中选择具体电影或剧集，不会默认使用第一集。
+官方弹幕含关联弹幕，已应用服务返回的匹配偏移；下方偏移用于额外调整。
+匹配/搜索缓存 2 小时，弹幕缓存 6 小时；可停用官方来源。
+公开备用服务： https://dmku.hls.one/ ； https://danmu.zxz.ee/ 。
 在线字幕：迅雷、SubHD 按片名查询；射手按视频指纹查询；SubtitleCat 作为可能机翻的末位备用。
 这些外部服务可能变更/限流、没有某部电影的数据。失败会显示原因，支持修改片名重新识别或手动补选文件。
-只发送查询片名、影片文件名/四段 MD5 和公开平台链接；不上传电影、原台词内容、NAS 目录或账号。
+只发送查询片名、影片文件名/内容指纹、大小、时长和公开平台链接；不上传电影、原台词内容、NAS 目录或账号。
 
 识别结果需核对片名、年份、时长，平台上架年份有时与上映年不同。
 弹幕偏移：正数延后、负数提前。不同剪辑版本可能无法只用一个偏移完全对齐。
@@ -1153,8 +1160,200 @@ def web_json(url, data=None, progress=None, message="下载数据"):
         raise ToolError("在线服务返回内容不是有效 JSON。") from None
 
 
+def dandan_protect(value, decrypt=False):
+    """Protect this machine's application key with Windows CurrentUser DPAPI."""
+    if os.name != "nt":
+        raise ToolError("非 Windows 请使用 DANDANPLAY_APP_ID 和 DANDANPLAY_APP_SECRET 环境变量。")
+    import ctypes
+    from ctypes import wintypes
+    class Blob(ctypes.Structure):
+        _fields_ = [("length", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_char))]
+    raw = base64.b64decode(value, validate=True) if decrypt else value.encode("utf-8")
+    buffer = ctypes.create_string_buffer(raw)
+    incoming = Blob(len(raw), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+    outgoing = Blob()
+    crypt = ctypes.WinDLL("crypt32", use_last_error=True)
+    method = crypt.CryptUnprotectData if decrypt else crypt.CryptProtectData
+    method.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                       ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob)]
+    method.restype = wintypes.BOOL
+    if not method(ctypes.byref(incoming), None, None, None, None, 1, ctypes.byref(outgoing)):
+        raise ToolError("无法读写本机加密凭证，请用当前 Windows 账号重新配置。")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    try:
+        result = ctypes.string_at(outgoing.data, outgoing.length)
+        return result.decode("utf-8") if decrypt else base64.b64encode(result).decode("ascii")
+    finally:
+        kernel.LocalFree(outgoing.data)
+
+
+def dandan_config():
+    data = load_local_json("dandanplay.local.json", dict(version=1, enabled=False, app_id="", protected_secret=""))
+    app_id = os.environ.get("DANDANPLAY_APP_ID", "") or data.get("app_id", "")
+    secret = os.environ.get("DANDANPLAY_APP_SECRET", "")
+    if not secret and data.get("protected_secret") and data.get("enabled"):
+        try:
+            secret = dandan_protect(data["protected_secret"], decrypt=True)
+        except (ValueError, UnicodeError):
+            raise ToolError("弹弹play本机凭证损坏，请重新配置。") from None
+    return dict(enabled=bool(data.get("enabled") or os.environ.get("DANDANPLAY_APP_ID")),
+                app_id=app_id, secret=secret)
+
+
+def save_dandan_config(app_id, secret, enabled):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", app_id):
+        raise ToolError("请填写有效的 AppId。")
+    data = load_local_json("dandanplay.local.json", dict(version=1))
+    if secret:
+        if len(secret) > 4096 or any(c.isspace() for c in secret):
+            raise ToolError("AppSecret 格式不正确，请重新粘贴。")
+        data["protected_secret"] = dandan_protect(secret)
+    elif data.get("app_id") != app_id:
+        data["protected_secret"] = ""
+    if enabled and not data.get("protected_secret") and not os.environ.get("DANDANPLAY_APP_SECRET"):
+        raise ToolError("启用前请填写 AppSecret。")
+    data.update(app_id=app_id, enabled=bool(enabled), version=1)
+    save_local_json("dandanplay.local.json", data)
+
+
+def dandan_headers(app_id, secret, path, timestamp=None):
+    timestamp = str(int(time.time()) if timestamp is None else timestamp)
+    path = urllib.parse.urlsplit(path).path
+    signature = base64.b64encode(hashlib.sha256((app_id + timestamp + path + secret).encode("utf-8")).digest()).decode("ascii")
+    return {"X-AppId": app_id, "X-Timestamp": timestamp, "X-Signature": signature,
+            "Content-Type": "application/json", "Accept": "application/json"}
+
+
+def dandan_request(path, payload=None, progress=None, *, use_cache=True):
+    # Only the three approved public read/matching APIs can be called from this client.
+    route = urllib.parse.urlsplit(path).path
+    if route not in {"/api/v2/match", "/api/v2/search/episodes"} and not re.fullmatch(r"/api/v2/comment/[1-9]\d*", route):
+        raise ToolError("不支持的弹弹play接口。")
+    config = dandan_config()
+    if not config["enabled"] or not config["app_id"] or not config["secret"]:
+        raise ToolError("请先在“弹弹play接入”中配置并启用官方来源。")
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") if payload is not None else None
+    cache_key = hashlib.sha256(config["app_id"].encode() + path.encode() + (body or b"")).hexdigest()
+    cache = filter_rules_path().parent / "cache" / "dandanplay" / (cache_key + ".json")
+    ttl = 6 * 3600 if "/comment/" in route else 2 * 3600
+    with DANDAN_REQUEST_LOCK:
+        report(progress, "查询弹弹play开放弹幕网络")
+        if use_cache and cache.is_file() and 0 <= time.time() - cache.stat().st_mtime < ttl:
+            try:
+                data = json.loads(read_text(cache))
+                if isinstance(data, dict) and not ("/comment/" in route and data.get("comments") == []):
+                    report(progress, "使用弹弹play本机缓存")
+                    return data
+            except (OSError, ValueError, ToolError):
+                pass
+        headers = dandan_headers(config["app_id"], config["secret"], route)
+        try:
+            raw = web_bytes("https://api.dandanplay.net" + path, data=body, progress=progress,
+                            message="获取弹弹play官方数据", request_headers=headers)
+        except ToolError as exc:
+            message = str(exc)
+            if "HTTP 403" in message or "HTTP 401" in message:
+                raise ToolError("弹弹play认证未通过，请核对应用凭证、应用状态及电脑时间。") from None
+            if "HTTP 429" in message:
+                raise ToolError("弹弹play调用额度或频率受限，请稍后重试；已有缓存仍可使用。") from None
+            raise
+        try:
+            data = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeError, ValueError):
+            raise ToolError("弹弹play返回的数据格式不正确。") from None
+        if not isinstance(data, dict):
+            raise ToolError("弹弹play返回的数据格式不正确。")
+        if data.get("success") is False:
+            # Avoid echoing remote messages or request details containing authentication data.
+            raise ToolError("弹弹play未完成本次查询，请检查关键词或稍后重试。")
+        if "/comment/" in route and data.get("comments") == []:
+            return data  # Let a user's explicit retry query the server again.
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache.with_suffix("." + uuid.uuid4().hex + ".tmp")
+        try:
+            temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, cache)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return data
+
+
+def dandan_movies(data, search=False):
+    rows = []
+    if search:
+        for anime in data.get("animes") or []:
+            for episode in anime.get("episodes") or []:
+                rows.append(dict(episode, animeTitle=anime.get("animeTitle", "")))
+    else:
+        rows = data.get("matches") or []
+    movies, seen = [], set()
+    for row in rows:
+        try:
+            episode_id = int(row["episodeId"])
+            if episode_id <= 0 or episode_id in seen:
+                continue
+            title = str(row.get("animeTitle") or "未命名作品")
+            episode = str(row.get("episodeTitle") or "")
+            seen.add(episode_id)
+            movies.append(dict(title=title + (" · " + episode if episode else ""), year="", duration="",
+                               links={"dandanplay": f"https://api.dandanplay.net/api/v2/comment/{episode_id}"},
+                               official_title=title, official_shift=finite(row.get("shift", 0)),
+                               official_exact=bool(data.get("isMatched")) and not search))
+        except (ValueError, TypeError, KeyError, ToolError):
+            continue
+    return movies
+
+
+def dandan_match(video, meta, progress=None):
+    video = Path(video)
+    report(progress, "读取影片前 16 MB 进行弹弹play匹配")
+    signature = file_signature(video)
+    digest, received, limit = hashlib.md5(), 0, 16 * 1024 * 1024
+    with video.open("rb") as stream:
+        while received < limit:
+            report(progress, "读取影片前 16 MB 进行弹弹play匹配", received, min(signature[0], limit), "字节")
+            chunk = stream.read(min(65536, limit - received))
+            if not chunk:
+                break
+            digest.update(chunk)
+            received += len(chunk)
+    if file_signature(video) != signature:
+        raise ToolError("影片读取时发生变化，请重新识别。")
+    payload = dict(fileName=video.stem, fileHash=digest.hexdigest(), fileSize=signature[0],
+                   videoDuration=int(finite(meta.get("format", {}).get("duration", 0) or 0)), matchMode="hashAndFileName")
+    return dandan_movies(dandan_request("/api/v2/match", payload, progress))
+
+
+def dandan_search(title, progress=None):
+    if len(title.strip()) < 2:
+        raise ToolError("搜索片名至少需要两个字符。")
+    data = dandan_request("/api/v2/search/episodes?" + urllib.parse.urlencode({"anime": title.strip(), "v2": "true"}), progress=progress)
+    if data.get("hasMore"):
+        report(progress, "弹弹play结果较多，请填写更具体的片名或集数缩小范围")
+    return dandan_movies(data, search=True)
+
+
 def normalize_title(text):
     return "".join(c for c in unicodedata.normalize("NFKC", html.unescape(str(text))).casefold() if c.isalnum())
+
+
+def dandan_candidates(movies, title):
+    """Keep exact file matches and plausible titles; multiple episodes need a choice."""
+    queries = [normalize_title(title)]
+    bilingual = re.match(r"^([\u4e00-\u9fff][^A-Za-z]*?)\s+[A-Za-z]", title)
+    if bilingual:
+        queries.append(normalize_title(bilingual.group(1)))
+    candidates = []
+    for movie in movies:
+        found = normalize_title(movie.get("official_title", movie["title"]))
+        if movie.get("official_exact") or any(query and
+                difflib.SequenceMatcher(None, found, query).ratio() >= .72 for query in queries):
+            candidates.append(dict(movie))
+    for movie in candidates:
+        movie["official_confirm"] = not movie.get("official_exact") and len(candidates) > 1
+    return candidates
 
 
 def filename_title(stem):
@@ -1927,8 +2126,24 @@ def fetch_bilibili_danmaku(url, progress=None):
 
 def fetch_public_danmaku(movie, progress, platform=None):
     errors = []
-    if platform is not None and (platform not in PLATFORMS or platform not in movie["links"]):
+    if platform is not None and (platform not in PLATFORM_NAMES or platform not in movie["links"]):
         raise ToolError("当前电影没有所选平台的链接，请选择列表中的其他来源。")
+    if platform == "dandanplay" or (platform is None and "dandanplay" in movie["links"]):
+        url = movie["links"]["dandanplay"]
+        if not re.fullmatch(r"https://api\.dandanplay\.net/api/v2/comment/[1-9]\d*", url):
+            raise ToolError("弹弹play节目编号无效。")
+        path = urllib.parse.urlsplit(url).path + "?withRelated=true&chConvert=0"
+        data = dandan_request(path, progress=progress)
+        if data.get("comments") == []:
+            raise ToolError("弹弹play此节目暂时没有弹幕，可切换其他来源。")
+        comments, _ = parse_comments(json.dumps(data, ensure_ascii=False))
+        shift = finite(movie.get("official_shift", 0))
+        if shift:
+            comments = [dataclass_replace(comment, time=comment.time + shift) for comment in comments]
+        source = "弹弹play开放弹幕网络 · 官方＋关联弹幕"
+        if shift:
+            source += f" · 已应用匹配偏移 {shift:+g} 秒"
+        return comments, source, url
     # 最多两种平台，失败信息可见；不会对所有来源无限重试。
     keys = [platform] if platform else [k for k in PLATFORMS if k in movie["links"]][:2]
     for key in keys:
@@ -1979,13 +2194,13 @@ class DanmakuSource:
 
     @property
     def label(self):
-        return (f"{PLATFORMS[self.platform]} · {len(self.comments):,} 条" + ("（部分取得，可重试）" if self.partial else "")) if self.available else f"{PLATFORMS[self.platform]} · 未取得"
+        return (f"{PLATFORM_NAMES[self.platform]} · {len(self.comments):,} 条" + ("（部分取得，可重试）" if self.partial else "")) if self.available else f"{PLATFORM_NAMES[self.platform]} · 未取得"
 
 
 def movie_source_key(movie):
     # 标题/年份及实际链接一起隔离缓存，避免切换版本时串用弹幕。
     return (movie.get("title", ""), movie.get("year", ""),
-            tuple((key, movie["links"][key]) for key in PLATFORMS if key in movie["links"]))
+            tuple((key, movie["links"][key]) for key in PLATFORM_NAMES if key in movie["links"]), movie.get("official_shift", 0))
 
 
 def source_summary(options):
@@ -2013,7 +2228,7 @@ def discover_danmaku_sources(result, movie, progress=None, retry_failed=False, o
     if previous is not None and not retry_failed:
         return previous
     retained = {option.platform: option for option in previous or [] if option.available}
-    keys = [platform for platform in PLATFORMS if platform in movie["links"]]
+    keys = [platform for platform in PLATFORM_NAMES if platform in movie["links"]]
     pending = [platform for platform in keys if platform not in retained or retained[platform].partial]
     if result.workspace is None:
         result.workspace = local_workspace()
@@ -2023,7 +2238,7 @@ def discover_danmaku_sources(result, movie, progress=None, retry_failed=False, o
             def detail(update):
                 message = update.message if isinstance(update, ProgressUpdate) else str(update)
                 if progress:
-                    progress(ProgressUpdate(f"{PLATFORMS[platform]}：{message}"))
+                    progress(ProgressUpdate(f"{PLATFORM_NAMES[platform]}：{message}"))
             comments, source, url = fetch_public_danmaku(movie, detail, platform=platform)
             if not comments:
                 raise ToolError("该来源未返回可用弹幕。")
@@ -2123,16 +2338,40 @@ def scan_movie(video, override="", progress=lambda _: None, on_update=None):
     publish()
     progress(f"识别片名：{identity['title']} {identity['year']}；正在查找字幕和电影弹幕…")
     report(progress, "查找字幕和电影来源", 0, 2, "项")
+    def find_movies():
+        official, notices = [], []
+        try:
+            if dandan_config()["enabled"]:
+                official = dandan_candidates(
+                    dandan_search(identity["title"], progress) if override else dandan_match(video, meta, progress), identity["title"])
+                if not official and not override:
+                    official = dandan_candidates(dandan_search(identity["title"], progress), identity["title"])
+                if not official:
+                    notices.append("弹弹play未找到片名相符的节目，已继续查询其他来源。")
+                elif any(movie.get("official_confirm") for movie in official):
+                    notices.append("弹弹play返回多个候选，请在电影列表中核对并选择具体电影或剧集。")
+        except (ToolError, OSError) as exc:
+            notices.append("弹弹play官方来源暂不可用：" + str(exc))
+        try:
+            fallback = search_movies(identity["title"], identity["year"])
+        except (ToolError, OSError) as exc:
+            if not official:
+                raise
+            fallback = []
+            notices.append("其他电影来源未取得：" + str(exc))
+        return ([movie for movie in official if not movie.get("official_confirm")] + fallback +
+                [movie for movie in official if movie.get("official_confirm")]), notices
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         sub_future = pool.submit(discover_subtitles, video, meta, lambda _: None, identity, result.workspace)
-        movie_future = pool.submit(search_movies, identity["title"], identity["year"])
+        movie_future = pool.submit(find_movies)
         for count, future in enumerate(concurrent.futures.as_completed([sub_future, movie_future]), 1):
             try:
                 if future is sub_future:
                     result.subtitles, warnings = future.result()
                     result.warnings.extend(warnings)
                 else:
-                    result.movies = future.result()
+                    result.movies, notices = future.result()
+                    result.warnings.extend(notices)
             except (ToolError, OSError) as exc:
                 label = "字幕识别失败：" if future is sub_future else "电影弹幕搜索失败："
                 result.warnings.append(label + str(exc))
@@ -2140,6 +2379,8 @@ def scan_movie(video, override="", progress=lambda _: None, on_update=None):
             publish()
     if result.movies:
         chosen = result.movies[0]
+        if chosen.get("official_confirm"):
+            return result
         if identity["year"] and chosen["year"] and identity["year"] != chosen["year"]:
             result.warnings.append(f"请核对版本：文件标记 {identity['year']} 年，弹幕平台标记 {chosen['year']} 年，可能是重映/不同剪辑版。")
         try:
@@ -2155,7 +2396,7 @@ def scan_movie(video, override="", progress=lambda _: None, on_update=None):
                 select_danmaku_source(result, chosen)
             publish()
         options = discover_danmaku_sources(result, chosen, progress, on_update=source_update)
-        result.warnings.extend(f"{PLATFORMS[option.platform]}未取得弹幕：{option.error}" for option in options if not option.available)
+        result.warnings.extend(f"{PLATFORM_NAMES[option.platform]}未取得弹幕：{option.error}" for option in options if not option.available)
         if any(option.available for option in options):
             select_danmaku_source(result, chosen)
     else:
@@ -2773,6 +3014,7 @@ class App:
         self.platform_keys = []
         self.source_status = tk.StringVar(value="选中电影后自动查询各平台，只列出已取得弹幕的可选来源。")
         self.settings_dialog = None
+        self.dandan_dialog = None
         self.settings_summary = tk.StringVar(value=self.settings_description())
         self.output_text = tk.StringVar(value="输出到：所选影片的原目录")
         self.result_summary = tk.StringVar()
@@ -2786,6 +3028,7 @@ class App:
         ttk.Label(head, text="字幕＋弹幕", style="Title.TLabel").pack(side="left")
         ttk.Button(head, text="使用说明", command=self.help).pack(side="right")
         ttk.Button(head, text="网页找字幕", command=self.subtitle_sites).pack(side="right", padx=6)
+        ttk.Button(head, text="弹弹play接入", command=self.open_dandan_settings).pack(side="right", padx=6)
         ttk.Label(p, text="选择一部电影，找到台词和弹幕，合成一条字幕放回原目录。", foreground="#606975").pack(anchor="w", pady=(4, 10))
         row = ttk.Frame(p)
         row.pack(fill="x")
@@ -2885,6 +3128,69 @@ class App:
         s = self.render_settings
         effective = min(s["area"], 68 if s["avoid_subtitles"] else 100)
         return f"弹幕设置 · 顶部 {effective}% / 字号 {s['font_size']}"
+
+    def open_dandan_settings(self):
+        if self.busy:
+            return
+        if self.dandan_dialog and self.dandan_dialog.winfo_exists():
+            return
+        win = self.dandan_dialog = tk.Toplevel(self.root)
+        win.title("弹弹play官方接入")
+        body, footer = scrollable_window(win, 660, 450)
+        try:
+            current = load_local_json("dandanplay.local.json", dict(version=1, app_id="", enabled=True))
+        except ToolError as exc:
+            current = dict(app_id="", enabled=False)
+            self.log(str(exc))
+        wrapped_label(body, text="弹弹play开放弹幕网络 · 官方来源\n启用后识别影片会读取前 16 MB 计算指纹，发送文件名、指纹、大小和时长；不上传影片内容。")
+        app_id = tk.StringVar(value=current.get("app_id", ""))
+        secret = tk.StringVar()
+        enabled = tk.BooleanVar(value=bool(current.get("enabled")))
+        for label, variable, mask in (("AppId", app_id, ""), ("AppSecret", secret, "●")):
+            ttk.Label(body, text=label).pack(anchor="w", pady=(10, 2))
+            entry = ttk.Entry(body, textvariable=variable, show=mask)
+            entry.pack(fill="x")
+        wrapped_label(body, text="AppSecret 留空会沿用本机已保存的密钥。新密钥由你从开发者中心复制后粘贴；本机使用 Windows 账号加密保存。")
+        ttk.Checkbutton(body, text="启用官方弹幕来源", variable=enabled).pack(anchor="w", pady=8)
+        note = tk.StringVar(value="已保存密钥，可验证连接。" if current.get("protected_secret") else "填写凭证后点击“保存并验证”。")
+        wrapped_label(body, textvariable=note)
+        ttk.Button(body, text="打开开发者中心", command=lambda: webbrowser.open("https://dev.dandanplay.com/Center")).pack(anchor="w", pady=6)
+        def save():
+            if self.busy:
+                return
+            values = (app_id.get().strip(), secret.get().strip(), enabled.get())
+            secret.set("")
+            title = self.title.get().strip() or "楚门的世界"
+            save_button.configure(state="disabled")
+            note.set("正在保存并验证连接…")
+            def work():
+                save_dandan_config(*values)
+                if values[2]:
+                    response = dandan_request("/api/v2/search/episodes?" + urllib.parse.urlencode({"anime": title, "v2": "true"}),
+                                              progress=self.progress, use_cache=False)
+                    return len(dandan_movies(response, search=True))
+                return None
+            def done(count):
+                if win.winfo_exists():
+                    note.set("官方来源已停用。" if count is None else f"官方接口验证成功，返回 {count} 个节目。重新识别影片即可使用。")
+                    save_button.configure(state="normal")
+                self.status.set("弹弹play官方接口已验证，可重新识别影片。" if count is not None else "弹弹play官方来源已停用。")
+            def safe_work():
+                try:
+                    return (True, work())
+                except (ToolError, OSError, ValueError) as exc:
+                    return (False, str(exc))
+            def show(result):
+                if result[0]:
+                    done(result[1])
+                elif win.winfo_exists():
+                    note.set("尚未验证成功：" + result[1])
+                    save_button.configure(state="normal")
+                    self.status.set("弹弹play配置已检查，但连接尚未验证成功。")
+            self.background(safe_work, show)
+        save_button = ttk.Button(footer, text="保存并验证", command=save)
+        save_button.pack(side="right")
+        ttk.Button(footer, text="关闭", command=win.destroy).pack(side="right", padx=6)
 
     def open_settings(self):
         if self.busy or (self.result and self.result.dm_ass):
@@ -3119,7 +3425,9 @@ class App:
             else:
                 self.subtitle.set("未找到可用文字字幕（见下方提示）")
             self.movie_box.configure(values=[movie_choice_label(m, result.source_catalog) for m in result.movies])
-            if result.movies:
+            if result.movies and result.movies[0].get("official_confirm"):
+                self.movie.set("请展开列表选择具体电影或剧集")
+            elif result.movies:
                 self.movie_box.current(0)
             else:
                 self.movie.set("未匹配到电影（可以修正片名重查）")
@@ -3166,9 +3474,10 @@ class App:
             self.platform.set("手动导入")
         else:
             self.platform.set("请选择已取得的来源" if available else "未取得可用来源" if options is not None else "来源待查询")
-        summary = source_summary(options) if movie else "未匹配到电影来源，可修正片名或手动补选弹幕。"
+        summary = source_summary(options) if movie else ("请先在电影列表选择具体电影或剧集，再获取弹幕。"
+            if r and r.movies else "未匹配到电影来源，可修正片名或手动补选弹幕。")
         if r and r.source_pending:
-            summary += ("；查询中：" if self.busy else "；待重试：") + "、".join(PLATFORMS[key] for key in r.source_pending)
+            summary += ("；查询中：" if self.busy else "；待重试：") + "、".join(PLATFORM_NAMES[key] for key in r.source_pending)
         self.source_status.set(summary + ("；未取得的原因见下方日志。" if any(not option.available for option in options or []) else ""))
 
     def change_platform(self, _=None):
@@ -3196,7 +3505,7 @@ class App:
         keep_manual = retry_failed and r.danmaku_source.startswith("手动补选") and bool(r.comments or r.dm_ass)
         if not retry_failed:
             clear_selected_danmaku(r)
-            r.source_pending = [platform for platform in PLATFORMS if platform in movie["links"] and
+            r.source_pending = [platform for platform in PLATFORM_NAMES if platform in movie["links"] and
                                 not any(row.platform == platform for row in r.source_catalog.get(key, []))]
         self.refresh_platforms()
         self.show_danmaku()
@@ -3216,7 +3525,7 @@ class App:
             self.show_danmaku()
             for option in options:
                 if final and not option.available:
-                    self.log(f"{PLATFORMS[option.platform]}未取得弹幕：{option.error}")
+                    self.log(f"{PLATFORM_NAMES[option.platform]}未取得弹幕：{option.error}")
             self.status.set("已列出弹幕来源与条数，切换直接使用本机缓存。" if any(option.available for option in options)
                             else "当前候选未取得在线弹幕，可重查来源、换候选或补选文件。")
             self.update_ready()

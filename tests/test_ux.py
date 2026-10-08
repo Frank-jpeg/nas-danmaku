@@ -282,14 +282,16 @@ class UXGuiTests(UXFixture, unittest.TestCase):
         self.app.sub_box.current(1)
         video = self.folder / 'film.mkv'
         video.write_bytes(b'video')
-        self.app.saved_offsets[d.video_preference_key(video)] = 2.5
+        # Windows runners can return an 8.3 alias for Temp; the app stores resolved paths.
+        resolved_video = video.resolve()
+        self.app.saved_offsets[d.video_preference_key(resolved_video)] = 2.5
         with patch.object(d, 'scan_movie') as search, \
                 patch.object(d, 'inspect_video', return_value={'format': {'duration': 60}}), \
                 patch.object(d.filedialog, 'askopenfilename', return_value=str(video)):
             self.app.browse()
             self.wait()
         search.assert_not_called()
-        self.assertEqual(self.app.result.video, video)
+        self.assertEqual(self.app.result.video, resolved_video)
         self.assertIs(self.app.result.comments, result.comments)
         self.assertEqual(self.app.sub_box.current(), 1)
         self.assertEqual(self.app.offset.get(), '2.5')

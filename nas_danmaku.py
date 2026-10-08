@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.8.2"
+VERSION = "2.8.3"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -1076,7 +1076,7 @@ NAS 写回失败会保留本机成品和待写回记录，重启后可恢复；�
 “来源”只列出已取得并缓存的弹幕，切换直接用本机缓存。未取得的来源单独标注，详细原因见日志。
 “重查来源”重试未取得、未完成及部分取得的项目，保留完整成功来源；补取失败仍保留原数据。
 顶部“弹弹play”按钮会显示已启用、已停用或未配置。已配置后自动查询，日常使用不必打开。
-设置窗口会明确显示凭证已保存；只有点击“修改凭证”才展开输入框。旧密钥不回显，无需重复填写。
+设置窗口直接填入已保存的 AppId 和密钥；密钥默认以圆点显示，点“显示”可查看、点“隐藏”可遮住。
 启用后优先匹配文件前 16 MB 的 MD5；匹配失败继续按片名搜索，官方候选进入电影列表。
 片名搜索优先查询官方 TMDB 电影目录及详情，按年份和中英文别名核对，未命中再查节目目录。
 模糊候选会核对片名；多个官方候选需在列表中选择具体电影或剧集，不会默认使用第一集。
@@ -1191,11 +1191,11 @@ def dandan_protect(value, decrypt=False):
         kernel.LocalFree(outgoing.data)
 
 
-def dandan_config():
+def dandan_config(*, include_disabled=False):
     data = load_local_json("dandanplay.local.json", dict(version=1, enabled=False, app_id="", protected_secret=""))
     app_id = os.environ.get("DANDANPLAY_APP_ID", "") or data.get("app_id", "")
     secret = os.environ.get("DANDANPLAY_APP_SECRET", "")
-    if not secret and data.get("protected_secret") and data.get("enabled"):
+    if not secret and data.get("protected_secret") and (data.get("enabled") or include_disabled):
         try:
             secret = dandan_protect(data["protected_secret"], decrypt=True)
         except (ValueError, UnicodeError):
@@ -1221,7 +1221,7 @@ def save_dandan_config(app_id, secret, enabled):
 
 
 def dandan_setup_state():
-    """UI metadata only: never return or decrypt the saved secret for display."""
+    """Status metadata only; opening settings loads credentials separately."""
     try:
         data = load_local_json("dandanplay.local.json", dict(version=1, app_id="", enabled=True))
     except ToolError as exc:
@@ -3229,35 +3229,51 @@ class App:
         show_summary(current)
         wrapped_label(body, textvariable=summary)
         wrapped_label(body, text="启用后会自动查询官方弹幕，日常使用无需打开此窗口。可在这里停用来源、检查连接或修改凭证。")
-        app_id = tk.StringVar(value=current["app_id"])
-        secret = tk.StringVar()
+        credential_error = ""
+        try:
+            original = dandan_config(include_disabled=True)
+        except (ToolError, OSError) as exc:
+            original = dict(app_id=current["app_id"], secret="")
+            credential_error = "已保存凭证读取失败：" + str(exc)
+        app_id = tk.StringVar(value=original["app_id"])
+        secret = tk.StringVar(value=original["secret"])
         enabled = tk.BooleanVar(value=current["enabled"])
-        ttk.Checkbutton(body, text="启用官方弹幕来源", variable=enabled).pack(anchor="w", pady=8)
-        editor_slot = ttk.Frame(body)
-        editor_slot.pack(fill="x")
-        editor = ttk.Frame(editor_slot)
-        for label, variable, mask in (("AppId", app_id, ""), ("新 AppSecret（已有密钥时留空沿用）", secret, "●")):
-            ttk.Label(editor, text=label).pack(anchor="w", pady=(10, 2))
-            entry = ttk.Entry(editor, textvariable=variable, show=mask)
-            entry.pack(fill="x")
-        wrapped_label(editor, text="已保存的密钥不回显。只有更换密钥时才填写；更换 AppId 必须同时提供对应密钥。")
+        enabled_box = ttk.Checkbutton(body, text="启用官方弹幕来源", variable=enabled)
+        enabled_box.pack(anchor="w", pady=8)
+        editor = ttk.Frame(body)
+        editor.pack(fill="x")
+        ttk.Label(editor, text="AppId").pack(anchor="w", pady=(10, 2))
+        app_entry = ttk.Entry(editor, textvariable=app_id)
+        app_entry.pack(fill="x")
+        ttk.Label(editor, text="AppSecret").pack(anchor="w", pady=(10, 2))
+        secret_row = ttk.Frame(editor)
+        secret_row.pack(fill="x")
+        secret_entry = ttk.Entry(secret_row, textvariable=secret, show="●")
+        secret_entry.pack(side="left", fill="x", expand=True)
+        def toggle_secret():
+            masked = bool(secret_entry.cget("show"))
+            secret_entry.configure(show="" if masked else "●")
+            show_button.configure(text="隐藏" if masked else "显示")
+        show_button = ttk.Button(secret_row, text="显示", width=6, command=toggle_secret)
+        show_button.pack(side="right", padx=(6, 0))
+        wrapped_label(editor, text="已保存的凭证会自动填入，无需重复输入。密钥默认遮住，可点“显示”查看；更换 AppId 时请同时填写对应的新密钥。")
         ttk.Button(editor, text="打开开发者中心", command=lambda: webbrowser.open("https://dev.dandanplay.com/Center")).pack(anchor="w", pady=6)
-        def edit_credentials():
-            editor.pack(fill="x")
-            edit_button.pack_forget()
-        edit_button = ttk.Button(body, text="修改凭证…", command=edit_credentials)
-        if current["configured"]:
-            edit_button.pack(anchor="w", pady=6)
-        else:
-            editor.pack(fill="x")
-        note = tk.StringVar(value="已保存密钥，不需要重新输入；可直接关闭并识别影片。" if current["configured"]
-                            else "填写凭证后点击“保存并验证”。")
+        note = tk.StringVar(value=credential_error or ("已填入保存的凭证，可直接关闭并识别影片。" if current["configured"]
+                            else "填写凭证后点击“保存并验证”。"))
         wrapped_label(body, textvariable=note)
         def save():
             if self.busy:
                 return
-            values = (app_id.get().strip(), secret.get().strip(), enabled.get())
-            secret.set("")
+            new_id, new_secret = app_id.get().strip(), secret.get().strip()
+            if new_id != original["app_id"] and original["secret"] and new_secret == original["secret"]:
+                note.set("更换 AppId 后，请同时填写对应的新 AppSecret。")
+                return
+            # An unchanged prefilled key retains the original encrypted value and avoids needless backups.
+            values = (new_id, "" if new_id == original["app_id"] and new_secret == original["secret"] else new_secret, enabled.get())
+            secret_entry.configure(show="●")
+            show_button.configure(text="显示")
+            for widget in (app_entry, secret_entry, enabled_box, show_button):
+                widget.configure(state="disabled")
             title = self.title.get().strip() or "楚门的世界"
             save_button.configure(state="disabled")
             note.set("正在保存并验证连接…")
@@ -3271,10 +3287,12 @@ class App:
             def done(count):
                 if win.winfo_exists():
                     note.set("官方来源已停用。" if count is None else f"官方接口验证成功，返回 {count} 部作品。重新识别影片即可使用。")
-                    editor.pack_forget()
-                    if not edit_button.winfo_manager():
-                        edit_button.pack(anchor="w", pady=6)
-                    save_button.configure(state="normal")
+                    try:
+                        original.update(dandan_config(include_disabled=True))
+                        app_id.set(original["app_id"])
+                        secret.set(original["secret"])
+                    except (ToolError, OSError) as exc:
+                        note.set("配置已保存，读取凭证失败：" + str(exc))
                 self.status.set("弹弹play官方接口已验证，可重新识别影片。" if count is not None else "弹弹play官方来源已停用。")
             def safe_work():
                 try:
@@ -3285,6 +3303,8 @@ class App:
                 state = self.refresh_dandan_status()
                 if win.winfo_exists():
                     show_summary(state)
+                    for widget in (app_entry, secret_entry, enabled_box, show_button, save_button):
+                        widget.configure(state="normal")
                 if result[0]:
                     done(result[1])
                 elif win.winfo_exists():

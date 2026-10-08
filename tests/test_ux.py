@@ -257,9 +257,11 @@ class UXGuiTests(UXFixture, unittest.TestCase):
         self.assertIs(footer.master, top)
         top.destroy()
 
-    def test_dandan_dialog_keeps_disabled_setting_and_never_prefills_secret(self):
+    def test_dandan_dialog_prefills_disabled_credentials_and_toggles_secret_visibility(self):
         d.save_local_json('dandanplay.local.json', dict(version=1, app_id='testapp', enabled=False, protected_secret='encrypted'))
-        self.app.open_dandan_settings()
+        with patch.object(d, 'dandan_protect', return_value='stored-test-secret') as decrypt:
+            self.app.open_dandan_settings()
+        decrypt.assert_called_once_with('encrypted', decrypt=True)
         def descendants(widget):
             for child in widget.winfo_children():
                 yield child
@@ -268,19 +270,23 @@ class UXGuiTests(UXFixture, unittest.TestCase):
         entries = [w for w in widgets if isinstance(w, d.ttk.Entry)]
         self.assertEqual(self.app.dandan_summary.get(), '弹弹play · 已停用')
         self.assertEqual(entries[0].get(), 'testapp')
-        self.assertEqual(entries[1].get(), '')
+        self.assertEqual(entries[1].get(), 'stored-test-secret')
         self.assertTrue(entries[1].cget('show'))
-        self.assertEqual(entries[0].master.winfo_manager(), '')
-        edit = next(w for w in widgets if isinstance(w, d.ttk.Button) and w.cget('text') == '修改凭证…')
-        edit.invoke()
         self.assertEqual(entries[0].master.winfo_manager(), 'pack')
+        toggle = next(w for w in widgets if isinstance(w, d.ttk.Button) and w.cget('text') == '显示')
+        toggle.invoke()
+        self.assertFalse(entries[1].cget('show'))
+        self.assertEqual(toggle.cget('text'), '隐藏')
+        toggle.invoke()
+        self.assertTrue(entries[1].cget('show'))
+        self.assertEqual(entries[1].get(), 'stored-test-secret')
         enabled = next(w for w in widgets if isinstance(w, d.ttk.Checkbutton))
         self.assertFalse(enabled.instate(['selected']))
 
     def test_saved_dandan_status_is_visible_without_decryption_or_network(self):
         d.save_local_json('dandanplay.local.json', dict(version=1, app_id='testapp', enabled=True, protected_secret='encrypted'))
         with patch.object(d, 'dandan_protect') as decrypt, patch.object(d, 'dandan_request') as network:
-            self.app.open_dandan_settings()
+            self.app.refresh_dandan_status()
         self.assertEqual(self.app.dandan_summary.get(), '弹弹play · 已启用')
         state = d.dandan_setup_state()
         self.assertTrue(state['configured'])
@@ -291,6 +297,9 @@ class UXGuiTests(UXFixture, unittest.TestCase):
 
     def test_dandan_disable_preserves_key_and_refreshes_main_status(self):
         d.save_local_json('dandanplay.local.json', dict(version=1, app_id='testapp', enabled=True, protected_secret='encrypted'))
+        decrypt = patch.object(d, 'dandan_protect', return_value='stored-test-secret')
+        decrypt.start()
+        self.addCleanup(decrypt.stop)
         self.app.open_dandan_settings()
         def descendants(widget):
             for child in widget.winfo_children():
@@ -308,6 +317,50 @@ class UXGuiTests(UXFixture, unittest.TestCase):
         self.assertEqual(saved['protected_secret'], 'encrypted')
         self.assertFalse(saved['enabled'])
         self.assertEqual(self.app.dandan_summary.get(), '弹弹play · 已停用')
+
+    def test_prefilled_dandan_key_is_retained_and_refilled_after_saving_blank(self):
+        d.save_local_json('dandanplay.local.json', dict(version=1, app_id='testapp', enabled=False, protected_secret='encrypted'))
+        decrypt = patch.object(d, 'dandan_protect', return_value='stored-test-secret')
+        mock_decrypt = decrypt.start()
+        self.addCleanup(decrypt.stop)
+        self.app.open_dandan_settings()
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        widgets = list(descendants(self.app.dandan_dialog))
+        entries = [w for w in widgets if isinstance(w, d.ttk.Entry)]
+        save = next(w for w in widgets if isinstance(w, d.ttk.Button) and w.cget('text') == '保存并验证')
+        with patch.object(d, 'dandan_request') as network:
+            save.invoke()
+            self.wait()
+            entries[1].delete(0, 'end')
+            save.invoke()
+            self.wait()
+        network.assert_not_called()
+        saved = d.load_local_json('dandanplay.local.json', {})
+        self.assertEqual(saved['protected_secret'], 'encrypted')
+        self.assertEqual(entries[1].get(), 'stored-test-secret')
+        self.assertTrue(entries[1].cget('show'))
+        self.assertTrue(all(call.kwargs.get('decrypt') for call in mock_decrypt.call_args_list))
+
+    def test_changing_app_id_cannot_save_the_old_prefilled_key_for_another_app(self):
+        d.save_local_json('dandanplay.local.json', dict(version=1, app_id='testapp', enabled=False, protected_secret='encrypted'))
+        with patch.object(d, 'dandan_protect', return_value='stored-test-secret'):
+            self.app.open_dandan_settings()
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        widgets = list(descendants(self.app.dandan_dialog))
+        entry = next(w for w in widgets if isinstance(w, d.ttk.Entry))
+        entry.delete(0, 'end')
+        entry.insert(0, 'differentapp')
+        save = next(w for w in widgets if isinstance(w, d.ttk.Button) and w.cget('text') == '保存并验证')
+        with patch.object(d, 'save_dandan_config') as persist:
+            save.invoke()
+        persist.assert_not_called()
+        self.assertFalse(self.app.busy)
 
     def test_unconfigured_dandan_dialog_shows_inputs_and_corrupt_config_is_explicit(self):
         self.app.open_dandan_settings()

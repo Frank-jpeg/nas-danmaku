@@ -165,6 +165,82 @@ class AutoTests(unittest.TestCase):
         self.assertTrue(again['output'].endswith('-v2.ass'))
         self.assertEqual(self.video.read_bytes(), before)
 
+    def test_title_search_caches_results_then_attaches_video_without_searching_again(self):
+        movie = dict(title='流浪地球', year='2019', duration='1:00',
+                     links={'qq': 'https://v.qq.com/x/cover/example1.html'})
+        subtitle = d.SubtitleChoice('在线测试', 'online', 100, doc=d.parse_srt(SRT))
+        snapshots = []
+        with patch.object(d, 'dandan_config', return_value={'enabled': False}), \
+                patch.object(d, 'title_subtitles', return_value=[subtitle]) as subs, \
+                patch.object(d, 'search_movies', return_value=[movie]) as search, \
+                patch.object(d, 'fetch_public_danmaku', return_value=([d.Comment(4, '测试弹幕')], '测试源', 'url')) as fetch, \
+                patch.object(d, 'sidecar_choices') as sidecars, \
+                patch.object(d, 'inspect_video') as probe, patch.object(d, 'online_subtitles') as hashes:
+            result = d.scan_movie(None, '流浪地球 2019', on_update=lambda r: snapshots.append(copy.deepcopy(r)))
+            probe.assert_not_called()
+            sidecars.assert_not_called()
+            hashes.assert_not_called()
+            search.assert_called_once_with('流浪地球', '2019')
+            self.assertIsNone(result.video)
+            self.assertTrue(result.comments)
+            self.assertTrue(result.subtitles[0].doc.events)
+            self.assertTrue(any(r.subtitles for r in snapshots))
+            with self.assertRaisesRegex(d.ToolError, '选择影片文件'):
+                d.synthesize(result)
+            probe.return_value = self.meta
+            attached = d.attach_search_video(result, self.video)
+            output = d.synthesize(attached)
+            self.assertEqual((search.call_count, subs.call_count, fetch.call_count), (1, 1, 1))
+        self.assertIsNone(result.video)
+        self.assertIs(attached.subtitles, result.subtitles)
+        self.assertIs(attached.source_catalog, result.source_catalog)
+        self.assertEqual(attached.workspace, result.workspace)
+        self.assertTrue(output['saved'])
+        self.assertEqual(Path(output['output']).parent, self.video.parent)
+
+    def test_title_search_works_with_missing_file_and_keeps_numeric_titles(self):
+        missing = self.folder / 'missing.mkv'
+        with patch.object(d, 'dandan_config', return_value={'enabled': False}), \
+                patch.object(d, 'discover_subtitles', return_value=([], [])), \
+                patch.object(d, 'search_movies', return_value=[]) as search:
+            for query, title, year in [('楚门的世界 1998', '楚门的世界', '1998'),
+                                       ('1917', '1917', ''), ('2012 2009', '2012', '2009')]:
+                with self.subTest(query=query):
+                    result = d.scan_movie(missing, query)
+                    self.assertIsNone(result.video)
+                    self.assertEqual((result.identity['title'], result.identity['year']), (title, year))
+                    self.assertTrue(any('只按片名搜索' in text for text in result.warnings))
+                    self.assertEqual(search.call_args.args, (title, year))
+            with self.assertRaises(d.ToolError):
+                d.scan_movie(missing)
+            with self.assertRaisesRegex(d.ToolError, '请输入电影名称'):
+                d.scan_movie(None, '  ')
+
+    def test_title_subtitle_fallback_skips_file_hash_and_supports_no_video(self):
+        identity = dict(title='楚门的世界 The Truman Show', year='1998')
+        self.assertEqual(d.subtitle_queries(None, identity), ['楚门的世界', 'The Truman Show'])
+        subtitle = d.SubtitleChoice('备用字幕', 'online', 100, doc=d.parse_srt(SRT))
+        with patch.object(d, 'subtitlecat_subtitles', return_value=[subtitle]) as last, \
+                patch.object(d, 'online_subtitles') as hashes:
+            result, warnings = d.discover_subtitles(None, {}, lambda _: None, identity, self.folder)
+        last.assert_called_once()
+        self.assertIsNone(last.call_args.args[0])
+        hashes.assert_not_called()
+        self.assertEqual(len(result), 1)
+        self.assertTrue(any('SubtitleCat' in warning for warning in warnings))
+
+    def test_failed_file_attachment_preserves_title_search_results(self):
+        result = d.ScanResult(None, {'title': '电影'}, {}, (), comments=[d.Comment(1, '保留')])
+        with self.assertRaises(d.ToolError):
+            d.attach_search_video(result, self.folder / 'missing.mkv')
+        self.assertIsNone(result.video)
+        self.assertEqual(result.comments[0].text, '保留')
+        with patch.object(d, 'inspect_video', side_effect=d.ToolError('超时')):
+            attached = d.attach_search_video(result, self.video)
+        self.assertEqual(attached.metadata, {})
+        self.assertTrue(any('超时' in warning for warning in attached.warnings))
+        self.assertFalse(result.warnings)
+
     def test_changed_video_and_missing_subtitle_block_output(self):
         result = d.ScanResult(self.video, {}, self.meta, d.file_signature(self.video), comments=[d.Comment(1,'弹幕')])
         with self.assertRaisesRegex(d.ToolError, '文字字幕'):

@@ -257,6 +257,66 @@ class UXGuiTests(UXFixture, unittest.TestCase):
         self.assertIs(footer.master, top)
         top.destroy()
 
+    def test_title_search_without_file_and_later_browse_preserves_selections(self):
+        subtitles = [d.SubtitleChoice(name, 'online', doc=d.parse_srt('1\n00:00:01,000 --> 00:00:03,000\n台词'))
+                     for name in ('版本一', '版本二')]
+        result = d.ScanResult(None, dict(title='电影', year='', source='手动片名'), {}, (),
+            subtitles=subtitles, comments=[d.Comment(1, '弹幕')], workspace=self.folder)
+        self.app.title.set('电影')
+        with patch.object(d, 'scan_movie', return_value=result) as search, \
+                patch.object(d.filedialog, 'askopenfilename') as picker:
+            self.app.retry_button.invoke()
+            self.wait()
+            picker.assert_not_called()
+        self.assertEqual(search.call_args.args[:2], (None, '电影'))
+        self.assertTrue(self.app.title_entry.bind('<Return>'))
+        self.assertEqual(self.app.path.get(), '')
+        self.assertIn('尚未选择影片文件', self.app.identity_text.get())
+        self.assertEqual(str(self.app.generate_button['state']), 'disabled')
+        self.assertEqual(str(self.app.embedded_button['state']), 'disabled')
+        with patch.object(d, 'synthesize') as generate:
+            self.app.generate()
+        generate.assert_not_called()
+        self.app.save_current_preferences()
+        self.assertFalse(self.app.saved_offsets)
+        self.app.sub_box.current(1)
+        video = self.folder / 'film.mkv'
+        video.write_bytes(b'video')
+        self.app.saved_offsets[d.video_preference_key(video)] = 2.5
+        with patch.object(d, 'scan_movie') as search, \
+                patch.object(d, 'inspect_video', return_value={'format': {'duration': 60}}), \
+                patch.object(d.filedialog, 'askopenfilename', return_value=str(video)):
+            self.app.browse()
+            self.wait()
+        search.assert_not_called()
+        self.assertEqual(self.app.result.video, video)
+        self.assertIs(self.app.result.comments, result.comments)
+        self.assertEqual(self.app.sub_box.current(), 1)
+        self.assertEqual(self.app.offset.get(), '2.5')
+        self.assertEqual(str(self.app.generate_button['state']), 'normal')
+        self.assertIn('弹幕版-film.ass', self.app.output_text.get())
+
+    def test_empty_title_search_keeps_current_result_and_does_not_open_picker(self):
+        result = self.app.result = d.ScanResult(None, {}, {}, ())
+        self.app.title.set('  ')
+        with patch.object(d, 'scan_movie') as search, patch.object(d.filedialog, 'askopenfilename') as picker:
+            self.app.retry_button.invoke()
+        search.assert_not_called()
+        picker.assert_not_called()
+        self.assertIs(self.app.result, result)
+        self.assertIn('请输入电影名称', self.app.status.get())
+
+    def test_failed_gui_attachment_keeps_cached_search_ready_for_retry(self):
+        result = self.app.result = d.ScanResult(None, dict(title='电影', year='', source='手动片名'), {}, (),
+                                               comments=[d.Comment(1, '保留')])
+        self.app.path.set(str(self.folder / 'missing.mkv'))
+        with patch.object(d.messagebox, 'showerror'):
+            self.app.scan()
+            self.wait()
+        self.assertIs(self.app.result, result)
+        self.assertEqual(self.app.result.comments[0].text, '保留')
+        self.assertEqual(str(self.app.generate_button['state']), 'disabled')
+
     def test_main_form_log_and_actions_fit_without_page_scrolling(self):
         def descendants(widget):
             for child in widget.winfo_children():

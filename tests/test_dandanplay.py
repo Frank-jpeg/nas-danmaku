@@ -126,6 +126,23 @@ class DandanplayTests(unittest.TestCase):
                 self.assertEqual([m['official_title'] for m in selected], ['楚门的世界'])
                 self.assertFalse(selected[0]['official_confirm'])
 
+    def test_title_only_search_uses_official_catalog_without_matching_a_file(self):
+        movies = d.dandan_movies({'animes': [{'animeTitle': '楚门的世界', 'episodes': [
+            {'episodeId': 1000371650001, 'episodeTitle': '电影正片'}]}]}, search=True)
+        with patch.object(d, 'dandan_config', return_value=self.config), \
+                patch.object(d, 'discover_subtitles', return_value=([], [])), \
+                patch.object(d, 'search_movies', return_value=[]), \
+                patch.object(d, 'dandan_match') as match, \
+                patch.object(d, 'dandan_search', return_value=movies) as search, \
+                patch.object(d, 'dandan_request', return_value={'comments': [{'p': '1,1,16777215,1', 'm': '官方'}]}):
+            result = d.scan_movie(None, '楚门的世界 1998')
+        match.assert_not_called()
+        self.assertEqual(search.call_args.args[0], '楚门的世界')
+        self.assertEqual(search.call_args.args[2], '1998')
+        self.assertIsNone(result.video)
+        self.assertEqual(result.comments[0].text, '官方')
+        self.assertEqual(result.selected_platform, 'dandanplay')
+
     def test_exact_hash_match_can_keep_a_title_in_another_language(self):
         movies = d.dandan_movies({'isMatched': True, 'matches': [
             {'episodeId': 1, 'animeTitle': 'The Truman Show'}]})

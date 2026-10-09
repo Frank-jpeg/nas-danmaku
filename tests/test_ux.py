@@ -437,6 +437,27 @@ class UXGuiTests(UXFixture, unittest.TestCase):
                             self.assertGreaterEqual(widget.winfo_height(), widget.winfo_reqheight())
                             self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth())
 
+    def test_settings_preview_and_controls_fit_small_desktop_together(self):
+        with patch.object(tk.Toplevel, 'winfo_screenwidth', return_value=1366), \
+                patch.object(tk.Toplevel, 'winfo_screenheight', return_value=768):
+            self.app.open_settings()
+        dialog = self.app.settings_dialog
+        dialog.window.withdraw()
+        self.root.update_idletasks()
+        dialog.window.event_generate('<Configure>')
+        self.root.update_idletasks()
+        canvas = dialog.canvas
+        body = canvas.master.master.master
+        viewport = body.master
+        self.assertLessEqual(body.winfo_reqheight(), viewport.winfo_height())
+        self.assertLessEqual(body.winfo_reqwidth(), viewport.winfo_width())
+        self.assertEqual((canvas.winfo_width(), canvas.winfo_height()), (512, 288))
+        self.assertGreater(dialog.keyword_button.winfo_rootx(), canvas.winfo_rootx() + canvas.winfo_width())
+        self.assertTrue(canvas.find_all())
+        dialog.variables['area'].set(35)
+        dialog.preview()
+        self.assertEqual(dialog.labels['area'].get(), '顶部 35%')
+
     def test_dandan_dialog_prefills_disabled_credentials_and_toggles_secret_visibility(self):
         d.save_local_json('dandanplay.local.json', dict(version=1, app_id='testapp', enabled=False, protected_secret='encrypted'))
         with patch.object(d, 'dandan_protect', return_value='stored-test-secret') as decrypt:

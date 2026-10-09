@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.11.0"
+VERSION = "2.12.0"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -2947,6 +2947,70 @@ def copy_to_video_dir(source, target, progress=None):
 
 # ---- 一个窗口：选择、展示、确认合成 ----
 
+UI_COLORS = dict(workspace="#f0f3f2", surface="#ffffff", ink="#20332f", muted="#64756f",
+                 line="#dce4e0", accent="#17745f", hover="#105c4c", soft="#e7f2ed")
+
+
+def setup_ui_theme(root):
+    """Use one palette for the main form and every native settings window."""
+    c = UI_COLORS
+    root.configure(background=c["workspace"])
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    style.configure(".", font=("Microsoft YaHei UI", 10), background=c["surface"], foreground=c["ink"])
+    style.configure("TFrame", background=c["surface"])
+    style.configure("Workspace.TFrame", background=c["workspace"])
+    style.configure("Panel.TFrame", background=c["surface"], bordercolor=c["line"], borderwidth=1, relief="solid")
+    style.configure("TLabel", background=c["surface"], foreground=c["ink"])
+    style.configure("Title.TLabel", font=("Microsoft YaHei UI", 18, "bold"))
+    style.configure("Section.TLabel", font=("Microsoft YaHei UI", 10, "bold"), foreground=c["accent"])
+    style.configure("Muted.TLabel", foreground=c["muted"])
+    style.configure("Badge.TLabel", background=c["soft"], foreground=c["accent"], padding=(8, 3))
+    style.configure("TButton", padding=(9, 3), borderwidth=1, bordercolor=c["line"], relief="flat",
+                    background=c["surface"], foreground=c["ink"], focuscolor=c["accent"])
+    style.map("TButton", background=[("disabled", "#f3f5f4"), ("active", c["soft"])],
+              foreground=[("disabled", "#78847f")], bordercolor=[("focus", c["accent"])])
+    style.configure("Accent.TButton", background=c["accent"], foreground="white", bordercolor=c["accent"],
+                    font=("Microsoft YaHei UI", 10, "bold"), padding=(14, 4))
+    style.map("Accent.TButton", background=[("disabled", "#dce6e1"), ("active", c["hover"])],
+              foreground=[("disabled", "#6a7d74"), ("!disabled", "white")],
+              bordercolor=[("disabled", "#dce6e1"), ("focus", c["hover"])])
+    for name in ("TEntry", "TCombobox", "TSpinbox"):
+        style.configure(name, padding=3, bordercolor=c["line"], lightcolor=c["surface"], darkcolor=c["line"],
+                        fieldbackground=c["surface"], foreground=c["ink"], arrowcolor=c["muted"])
+        style.map(name, bordercolor=[("focus", c["accent"])],
+                  fieldbackground=[("disabled", "#f1f4f2"), ("readonly", c["surface"])],
+                  foreground=[("disabled", "#78847f")], selectbackground=[("!focus", c["soft"])],
+                  selectforeground=[("!focus", c["ink"])])
+    style.configure("TLabelframe", bordercolor=c["line"], background=c["surface"])
+    style.configure("TLabelframe.Label", foreground=c["accent"], font=("Microsoft YaHei UI", 10, "bold"))
+    for name in ("TCheckbutton", "TRadiobutton"):
+        style.configure(name, background=c["surface"], padding=2, focuscolor=c["accent"])
+        style.map(name, background=[("active", c["soft"])], foreground=[("disabled", "#78847f")])
+    style.configure("Treeview", rowheight=29, fieldbackground=c["surface"], background=c["surface"], bordercolor=c["line"])
+    style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 10, "bold"), background="#edf2ef", padding=6)
+    style.map("Treeview", background=[("selected", c["soft"])], foreground=[("selected", c["accent"])])
+    style.configure("Horizontal.TProgressbar", background=c["accent"], troughcolor=c["soft"], borderwidth=0, thickness=5)
+    style.configure("TScrollbar", background="#c6d4cd", troughcolor=c["workspace"], bordercolor=c["workspace"], arrowsize=13)
+    style.configure("TSeparator", background=c["line"])
+    style.configure("Horizontal.TScale", background=c["surface"], troughcolor=c["soft"], bordercolor=c["line"])
+    for option, value in (("background", c["surface"]), ("foreground", c["ink"]), ("insertBackground", c["ink"]),
+                          ("selectBackground", c["soft"]), ("selectForeground", c["ink"]),
+                          ("highlightBackground", c["line"]), ("highlightColor", c["accent"]),
+                          ("highlightThickness", 1), ("borderWidth", 0)):
+        root.option_add("*Text." + option, value)
+    root.option_add("*TCombobox*Listbox.font", ("Microsoft YaHei UI", 10))
+    root.option_add("*TCombobox*Listbox.selectBackground", c["soft"])
+    root.option_add("*TCombobox*Listbox.selectForeground", c["ink"])
+
+
+def ui_section(parent, title, *, expand=False):
+    panel = ttk.Frame(parent, style="Panel.TFrame", padding=(10, 6))
+    panel.pack(fill="both" if expand else "x", expand=expand, pady=(0, 6))
+    ttk.Label(panel, text=title, style="Section.TLabel").pack(anchor="w", pady=(0, 4))
+    return panel
+
+
 def scrollable_window(window, width, height):
     """Keep actions outside a scrollable body and fit the current screen."""
     width = min(width, max(320, window.winfo_screenwidth() - 80))
@@ -2957,7 +3021,7 @@ def scrollable_window(window, width, height):
     footer.pack(side="bottom", fill="x")
     holder = ttk.Frame(window)
     holder.pack(fill="both", expand=True)
-    canvas = tk.Canvas(holder, highlightthickness=0)
+    canvas = tk.Canvas(holder, highlightthickness=0, background=UI_COLORS["surface"])
     vertical = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
     horizontal = ttk.Scrollbar(holder, orient="horizontal", command=canvas.xview)
     horizontal.pack(side="bottom", fill="x")
@@ -2979,9 +3043,10 @@ def scrollable_window(window, width, height):
 
 
 def wrapped_label(parent, **kwargs):
+    kwargs.setdefault("wraplength", 560)
     label = ttk.Label(parent, **kwargs)
     label.pack(anchor="w", fill="x")
-    parent.bind("<Configure>", lambda event: label.configure(wraplength=max(180, event.width - 24)), add="+")
+    parent.bind("<Configure>", lambda event: label.configure(wraplength=max(180, event.width - 40)), add="+")
     return label
 
 
@@ -2991,17 +3056,17 @@ def main_window_layout(window):
     height = min(920, max(480, window.winfo_screenheight() - 100))
     window.geometry(f"{width}x{height}")
     window.minsize(min(width, 1100), min(height, 760))
-    footer = ttk.Frame(window, padding=(12, 6))
+    footer = ttk.Frame(window, padding=(16, 10))
     footer.pack(side="bottom", fill="x")
-    content = ttk.Frame(window)
+    content = ttk.Frame(window, style="Workspace.TFrame")
     content.pack(fill="both", expand=True)
-    content.columnconfigure(0, weight=3)
-    content.columnconfigure(1, weight=1, minsize=250)
+    content.columnconfigure(0, weight=7, minsize=640, uniform="main")
+    content.columnconfigure(1, weight=3, minsize=300, uniform="main")
     content.rowconfigure(0, weight=1)
-    form = ttk.Frame(content, padding=(12, 8))
+    form = ttk.Frame(content, style="Workspace.TFrame", padding=(16, 12, 8, 4))
     form.grid(row=0, column=0, sticky="nsew")
-    sidebar = ttk.Frame(content)
-    sidebar.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=8)
+    sidebar = ttk.Frame(content, style="Workspace.TFrame")
+    sidebar.grid(row=0, column=1, sticky="nsew", padx=(0, 16), pady=(12, 12))
     return form, footer, sidebar
 
 
@@ -3045,6 +3110,7 @@ class FilterRulesDialog:
         self.window.title("弹幕屏蔽规则 · 内置和自定义")
         frame, footer = scrollable_window(self.window, 860, 760)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
+        ttk.Label(frame, text="屏蔽规则", style="Title.TLabel").pack(anchor="w", pady=(0, 6))
         ttk.Label(frame, text="内置规则也能修改、停用或删除。普通关键词包含就屏蔽；正则用于匹配日期等写法规律。", wraplength=820).pack(anchor="w")
         self.tree = ttk.Treeview(frame, columns=("enabled", "source", "name", "kind"), show="headings", height=6, selectmode="browse")
         for key, label, width in (("enabled", "启用", 55), ("source", "来源", 65), ("name", "规则名称", 210), ("kind", "匹配方式", 330)):
@@ -3100,7 +3166,7 @@ class FilterRulesDialog:
         ttk.Label(frame, textvariable=self.notice, wraplength=820).pack(anchor="w", pady=8)
         row = footer
         ttk.Label(row, text="保存即生效。", foreground="#606975").pack(side="left")
-        ttk.Button(row, text="保存并生效", command=self.save).pack(side="right")
+        ttk.Button(row, text="保存并生效", style="Accent.TButton", command=self.save).pack(side="right")
         ttk.Button(row, text="取消", command=self.close).pack(side="right", padx=6)
         self.refresh()
 
@@ -3250,7 +3316,7 @@ class DanmakuSettingsDialog:
         self.app = app
         self.window = tk.Toplevel(app.root)
         self.window.title("弹幕设置")
-        frame, footer = scrollable_window(self.window, 600, 740)
+        body, footer = scrollable_window(self.window, 1120, 600)
         current = app.render_settings
         self.rule_rows = copy.deepcopy(current["filter_rules"] if current["filter_rules"] is not None else default_filter_rules())
         self.rules_dialog = None
@@ -3261,8 +3327,16 @@ class DanmakuSettingsDialog:
         self.variables["speed"] = tk.DoubleVar(value=DEFAULT_DANMAKU_DURATION * 100 / current["duration"])
         self.variables["density"] = tk.StringVar(value=app.density.get())
         self.labels = {}
-        ttk.Label(frame, text="弹幕设置", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(frame, text="应用后重新合成，电视加载新生成的字幕即可。", foreground="#606975").pack(anchor="w", pady=(2, 10))
+        ttk.Label(body, text="弹幕设置", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(body, text="边调边看显示效果。应用后重新合成，电视加载新生成的字幕即可。", style="Muted.TLabel").pack(anchor="w", pady=(2, 16))
+        columns = ttk.Frame(body)
+        columns.pack(fill="both", expand=True)
+        preview_panel = ttk.Frame(columns, padding=(0, 0, 20, 0))
+        preview_panel.pack(side="left", fill="y")
+        ttk.Label(preview_panel, text="画面预览", style="Section.TLabel").pack(anchor="w", pady=(0, 10))
+        frame = ttk.Frame(columns)
+        frame.pack(side="left", fill="both", expand=True)
+        ttk.Label(frame, text="过滤与显示", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
         row = ttk.Frame(frame)
         row.pack(fill="x")
         ttk.Label(row, text="屏蔽类型").pack(side="left", padx=(0, 10))
@@ -3275,8 +3349,8 @@ class DanmakuSettingsDialog:
         row = ttk.Frame(frame)
         row.pack(fill="x", pady=(0, 4))
         ttk.Checkbutton(row, text="过滤垃圾弹幕（打卡、报时、闲聊等）", variable=self.variables["block_noise"]).pack(side="left")
-        self.keyword_button = ttk.Button(row, text="屏蔽规则（内置＋自定义）…", command=self.edit_keywords)
-        self.keyword_button.pack(side="right")
+        self.keyword_button = ttk.Button(frame, text="屏蔽规则（内置＋自定义）…", command=self.edit_keywords)
+        self.keyword_button.pack(anchor="w", pady=(0, 8))
         for key, label, low, high in (("area", "显示区域", 10, 100), ("opacity", "不透明度", 10, 100),
                                       ("font_size", "弹幕字号", 16, 64), ("speed", "弹幕速度", 50, 200)):
             row = ttk.Frame(frame)
@@ -3284,19 +3358,19 @@ class DanmakuSettingsDialog:
             ttk.Label(row, text=label, width=10).pack(side="left")
             ttk.Scale(row, from_=low, to=high, variable=self.variables[key], command=lambda _: self.preview()).pack(side="left", fill="x", expand=True, padx=10)
             self.labels[key] = tk.StringVar()
-            ttk.Label(row, textvariable=self.labels[key], width=17).pack(side="left")
+            ttk.Label(row, textvariable=self.labels[key], width=15).pack(side="left")
         row = ttk.Frame(frame)
         row.pack(fill="x", pady=(6, 10))
         ttk.Label(row, text="同屏最多", width=10).pack(side="left")
         ttk.Spinbox(row, from_=1, to=30, width=5, textvariable=self.variables["density"], command=self.preview).pack(side="left", padx=10)
         ttk.Label(row, text="条；区域放不下时自动减少", foreground="#606975").pack(side="left")
-        self.canvas = tk.Canvas(frame, width=512, height=288, background="#111c29", highlightthickness=0)
+        self.canvas = tk.Canvas(preview_panel, width=512, height=288, background="#111c29", highlightthickness=0)
         self.canvas.pack(pady=(0, 6))
         self.note = tk.StringVar()
-        ttk.Label(frame, textvariable=self.note, foreground="#606975", wraplength=512).pack(anchor="w")
+        ttk.Label(preview_panel, textvariable=self.note, style="Muted.TLabel", wraplength=512).pack(anchor="w")
         row = footer
         ttk.Button(row, text="恢复默认", command=self.reset).pack(side="left")
-        ttk.Button(row, text="应用设置", command=self.apply).pack(side="right")
+        ttk.Button(row, text="应用设置", style="Accent.TButton", command=self.apply).pack(side="right")
         ttk.Button(row, text="取消", command=self.window.destroy).pack(side="right", padx=6)
         self.preview()
 
@@ -3444,22 +3518,33 @@ class App:
         self.dandan_summary = tk.StringVar()
         self.refresh_dandan_status()
         self.settings_summary = tk.StringVar(value=self.settings_description())
-        self.output_text = tk.StringVar(value="输出到：所选影片的原目录")
+        self.output_text = tk.StringVar(value="未选择影片时生成到本机；选影片后可写回原目录。")
         self.result_summary = tk.StringVar()
-        style = ttk.Style(root)
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 17, "bold"))
-        style.configure("TLabel", font=("Microsoft YaHei UI", 10))
-        style.configure("TButton", padding=(8, 4))
-        p, footer, sidebar = main_window_layout(root)
-        head = ttk.Frame(p)
-        head.pack(fill="x")
-        ttk.Label(head, text="字幕＋弹幕", style="Title.TLabel").pack(side="left")
+        setup_ui_theme(root)
+        head = ttk.Frame(root, padding=(16, 8))
+        head.pack(side="top", fill="x")
+        brand = ttk.Frame(head)
+        brand.pack(side="left")
+        ttk.Label(brand, text="字幕＋弹幕", style="Title.TLabel").pack(side="left")
+        ttk.Label(brand, text="合成工作台", style="Muted.TLabel").pack(side="left", padx=(14, 0))
         ttk.Button(head, text="使用说明", command=self.help).pack(side="right")
         ttk.Button(head, text="网页找字幕", command=self.subtitle_sites).pack(side="right", padx=6)
-        ttk.Button(head, textvariable=self.dandan_summary, command=self.open_dandan_settings).pack(side="right", padx=6)
-        ttk.Label(p, text="可按片名搜索并生成到本机；选影片后可写回原目录。", foreground="#606975").pack(anchor="w", pady=(2, 6))
-        row = ttk.Frame(p)
+        ttk.Button(head, textvariable=self.dandan_summary, command=self.open_dandan_settings).pack(side="right")
+        ttk.Separator(root).pack(fill="x")
+        p, footer, sidebar = main_window_layout(root)
+
+        find = ui_section(p, "01  /  查找电影")
+        row = ttk.Frame(find)
         row.pack(fill="x")
+        ttk.Label(row, text="电影名称", width=9).pack(side="left")
+        self.title_entry = ttk.Entry(row, textvariable=self.title)
+        self.title_entry.pack(side="left", fill="x", expand=True)
+        self.title_entry.bind("<Return>", lambda _: self.scan(override=True))
+        self.retry_button = ttk.Button(row, text="按片名搜索", style="Accent.TButton", command=lambda: self.scan(override=True))
+        self.retry_button.pack(side="left", padx=(8, 0))
+        row = ttk.Frame(find)
+        row.pack(fill="x", pady=(7, 5))
+        ttk.Label(row, text="影片文件", width=9, style="Muted.TLabel").pack(side="left")
         self.path_entry = ttk.Entry(row, textvariable=self.path)
         self.path_entry.pack(side="left", fill="x", expand=True)
         self.path_entry.bind("<Return>", lambda _: self.scan())
@@ -3467,82 +3552,79 @@ class App:
         self.browse_button.pack(side="left", padx=(8, 0))
         self.scan_button = ttk.Button(row, text="识别", command=self.scan)
         self.scan_button.pack(side="left", padx=(6, 0))
-        row = ttk.Frame(p)
-        row.pack(fill="x", pady=6)
-        ttk.Label(row, text="电影名称", width=10).pack(side="left")
-        self.title_entry = ttk.Entry(row, textvariable=self.title)
-        self.title_entry.pack(side="left", fill="x", expand=True)
-        self.title_entry.bind("<Return>", lambda _: self.scan(override=True))
-        self.retry_button = ttk.Button(row, text="按片名搜索", command=lambda: self.scan(override=True))
-        self.retry_button.pack(side="left", padx=(8, 0))
-        ttk.Label(p, textvariable=self.identity_text, foreground="#606975", wraplength=790).pack(anchor="w", pady=(0, 4))
-        box = ttk.LabelFrame(p, text="找到的原台词字幕", padding=6)
-        box.pack(fill="x", pady=4)
-        self.sub_box = ttk.Combobox(box, state="readonly", textvariable=self.subtitle)
-        self.sub_box.pack(side="left", fill="x", expand=True)
-        self.manual_sub = ttk.Button(box, text="补选字幕…", command=self.pick_subtitle)
-        self.manual_sub.pack(side="left", padx=(8, 0))
-        self.embedded_button = ttk.Button(box, text="使用内封", command=self.use_embedded)
-        self.embedded_button.pack(side="left", padx=(6, 0))
-        box = ttk.LabelFrame(p, text="找到的电影弹幕", padding=6)
-        box.pack(fill="x", pady=4)
-        row = ttk.Frame(box)
+        wrapped_label(find, textvariable=self.identity_text, style="Muted.TLabel")
+
+        resources = ui_section(p, "02  /  选择字幕与弹幕")
+        row = ttk.Frame(resources)
         row.pack(fill="x")
+        ttk.Label(row, text="台词字幕", width=9).pack(side="left")
+        self.sub_box = ttk.Combobox(row, state="readonly", textvariable=self.subtitle)
+        self.sub_box.pack(side="left", fill="x", expand=True)
+        self.manual_sub = ttk.Button(row, text="补选字幕…", command=self.pick_subtitle)
+        self.manual_sub.pack(side="left", padx=(8, 0))
+        self.embedded_button = ttk.Button(row, text="使用内封", command=self.use_embedded)
+        self.embedded_button.pack(side="left", padx=(6, 0))
+        row = ttk.Frame(resources)
+        row.pack(fill="x", pady=(7, 0))
+        ttk.Label(row, text="电影匹配", width=9).pack(side="left")
         self.movie_box = ttk.Combobox(row, state="readonly", textvariable=self.movie)
         self.movie_box.pack(side="left", fill="x", expand=True)
         self.movie_box.bind("<<ComboboxSelected>>", self.change_movie)
         self.manual_dm = ttk.Button(row, text="补选弹幕…", command=self.pick_danmaku)
         self.manual_dm.pack(side="left", padx=(8, 0))
-        row = ttk.Frame(box)
-        row.pack(fill="x", pady=(6, 0))
-        ttk.Label(row, text="来源").pack(side="left", padx=(8, 4))
+        row = ttk.Frame(resources)
+        row.pack(fill="x", pady=(7, 0))
+        ttk.Label(row, text="弹幕来源", width=9).pack(side="left")
         self.platform_box = ttk.Combobox(row, state="disabled", textvariable=self.platform, width=28)
         self.platform_box.pack(side="left", fill="x", expand=True)
         self.platform_box.bind("<<ComboboxSelected>>", self.change_platform)
         self.retry_sources_button = ttk.Button(row, text="重查来源", command=self.retry_sources)
         self.retry_sources_button.pack(side="left", padx=(8, 0))
-        details = ttk.LabelFrame(sidebar, text="弹幕状态", padding=8)
-        details.pack(fill="x", pady=(0, 8))
-        wrapped_label(details, textvariable=self.source_status, wraplength=280, foreground="#606975")
-        wrapped_label(details, textvariable=self.dm_text, wraplength=280, foreground="#31566e")
-        row = ttk.Frame(p)
-        row.pack(fill="x", pady=6)
-        ttk.Label(row, text="弹幕偏移（秒）").pack(side="left")
-        ttk.Entry(row, textvariable=self.offset, width=8).pack(side="left", padx=6)
-        ttk.Label(row, text="正数延后，负数提前", foreground="#606975").pack(side="left")
-        ttk.Label(row, text="最多同屏").pack(side="left", padx=(22, 0))
-        ttk.Spinbox(row, from_=1, to=30, textvariable=self.density, width=5).pack(side="left", padx=6)
-        ttk.Label(row, text="条").pack(side="left")
-        self.settings_button = ttk.Button(row, textvariable=self.settings_summary, command=self.open_settings)
-        self.settings_button.pack(side="right")
-        ttk.Label(p, textvariable=self.output_text, wraplength=790).pack(anchor="w", pady=(0, 8))
-        row = ttk.Frame(footer)
+
+        settings = ui_section(p, "03  /  调整与生成")
+        row = ttk.Frame(settings)
         row.pack(fill="x")
-        self.generate_button = ttk.Button(row, text="确认合成并写回", command=self.generate, state="disabled")
-        self.generate_button.pack(side="left", fill="x", expand=True)
-        self.retry_copy_button = ttk.Button(row, text="重试写回 NAS", command=self.retry_copy, state="disabled")
-        self.retry_copy_button.pack(side="left", padx=(6, 0))
-        self.cancel_button = ttk.Button(row, text="停止等待", command=self.cancel_task, state="disabled")
-        self.cancel_button.pack(side="left", padx=(6, 0))
-        row = ttk.Frame(footer)
-        row.pack(fill="x", pady=(4, 0))
-        self.open_output_button = ttk.Button(row, text="打开成品文件夹", command=self.open_output, state="disabled")
-        self.open_output_button.pack(side="left")
-        self.copy_path_button = ttk.Button(row, text="复制成品路径", command=self.copy_output_path, state="disabled")
-        self.copy_path_button.pack(side="left", padx=6)
-        ttk.Button(row, text="待写回任务…", command=self.choose_pending).pack(side="right")
-        self.progress_bar = ttk.Progressbar(footer, mode="determinate", maximum=100)
-        self.progress_bar.pack(fill="x", pady=(6, 6))
-        wrapped_label(footer, textvariable=self.result_summary)
-        wrapped_label(footer, textvariable=self.status)
-        wrapped_label(footer, textvariable=self.progress_text, foreground="#606975")
-        log_frame = ttk.LabelFrame(sidebar, text="运行日志", padding=8)
-        log_frame.pack(fill="both", expand=True)
-        self.log_box = tk.Text(log_frame, width=32, height=6, wrap="word", state="disabled", font=("Microsoft YaHei UI", 9))
+        ttk.Label(row, text="弹幕偏移").pack(side="left")
+        ttk.Entry(row, textvariable=self.offset, width=6).pack(side="left", padx=6)
+        ttk.Label(row, text="秒（＋延后 / −提前）", style="Muted.TLabel").pack(side="left")
+        ttk.Label(row, text="同屏最多").pack(side="left", padx=(16, 0))
+        ttk.Spinbox(row, from_=1, to=30, textvariable=self.density, width=4).pack(side="left", padx=6)
+        ttk.Label(row, text="条", style="Muted.TLabel").pack(side="left")
+        self.settings_button = ttk.Button(row, text="弹幕设置…", command=self.open_settings)
+        self.settings_button.pack(side="right")
+        ttk.Label(settings, textvariable=self.settings_summary, style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
+        wrapped_label(settings, textvariable=self.output_text)
+
+        details = ui_section(sidebar, "当前弹幕")
+        wrapped_label(details, textvariable=self.dm_text, foreground=UI_COLORS["accent"])
+        ttk.Separator(details).pack(fill="x", pady=8)
+        wrapped_label(details, textvariable=self.source_status, style="Muted.TLabel")
+        log_frame = ui_section(sidebar, "运行日志", expand=True)
+        self.log_box = tk.Text(log_frame, width=32, height=6, wrap="word", state="disabled",
+                               font=("Microsoft YaHei UI", 9), padx=6, pady=6)
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_box.yview)
         self.log_box.configure(yscrollcommand=scrollbar.set)
         self.log_box.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+        row = ttk.Frame(footer)
+        row.pack(fill="x")
+        self.generate_button = ttk.Button(row, text="生成到本机", style="Accent.TButton", command=self.generate, state="disabled")
+        self.generate_button.pack(side="right")
+        self.cancel_button = ttk.Button(row, text="停止等待", command=self.cancel_task, state="disabled")
+        self.cancel_button.pack(side="right", padx=8)
+        self.open_output_button = ttk.Button(row, text="打开成品文件夹", command=self.open_output, state="disabled")
+        self.open_output_button.pack(side="left")
+        self.copy_path_button = ttk.Button(row, text="复制成品路径", command=self.copy_output_path, state="disabled")
+        self.copy_path_button.pack(side="left", padx=6)
+        self.retry_copy_button = ttk.Button(row, text="重试写回 NAS", command=self.retry_copy, state="disabled")
+        self.retry_copy_button.pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="待写回任务…", command=self.choose_pending).pack(side="left", padx=6)
+        self.progress_bar = ttk.Progressbar(footer, mode="determinate", maximum=100)
+        self.progress_bar.pack(fill="x", pady=(7, 5))
+        wrapped_label(footer, textvariable=self.result_summary)
+        wrapped_label(footer, textvariable=self.status)
+        wrapped_label(footer, textvariable=self.progress_text, style="Muted.TLabel")
         self.root.after(100, self.poll)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         if self.pending_output:
@@ -3572,7 +3654,8 @@ class App:
             return
         win = self.dandan_dialog = tk.Toplevel(self.root)
         win.title("弹弹play设置")
-        body, footer = scrollable_window(win, 660, 470)
+        body, footer = scrollable_window(win, 680, 600)
+        ttk.Label(body, text="弹弹play接入", style="Title.TLabel").pack(anchor="w", pady=(0, 10))
         current = self.refresh_dandan_status()
         summary = tk.StringVar()
         def show_summary(state):
@@ -3668,7 +3751,7 @@ class App:
                     save_button.configure(state="normal")
                     self.status.set("弹弹play配置已检查，但连接尚未验证成功。")
             self.background(safe_work, show)
-        save_button = ttk.Button(footer, text="保存并验证", command=save)
+        save_button = ttk.Button(footer, text="保存并验证", style="Accent.TButton", command=save)
         save_button.pack(side="right")
         ttk.Button(footer, text="关闭", command=win.destroy).pack(side="right", padx=6)
 
@@ -3683,7 +3766,16 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("使用说明")
         win.geometry("740x610")
-        text = tk.Text(win, wrap="word", padx=15, pady=15, font=("Microsoft YaHei UI", 10))
+        header = ttk.Frame(win, padding=(16, 12))
+        header.pack(fill="x")
+        ttk.Label(header, text="使用说明", style="Title.TLabel").pack(side="left")
+        ttk.Button(header, text="关闭", command=win.destroy).pack(side="right")
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True)
+        text = tk.Text(body, wrap="word", padx=16, pady=12, font=("Microsoft YaHei UI", 10))
+        scrollbar = ttk.Scrollbar(body, command=text.yview)
+        scrollbar.pack(side="right", fill="y")
+        text.configure(yscrollcommand=scrollbar.set)
         text.pack(fill="both", expand=True)
         text.insert("1.0", HELP)
         text.configure(state="disabled")
@@ -3698,6 +3790,8 @@ class App:
         win.title("字幕网站补选")
         frame = ttk.Frame(win, padding=16)
         frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="网页找字幕", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(frame, text=title, style="Badge.TLabel", wraplength=500).pack(anchor="w", pady=(0, 12))
         ttk.Label(frame, text="自动来源没有合适版本时，可在网站搜索后下载 SRT/ASS，再点“补选字幕”。", wraplength=500).pack(anchor="w", pady=(0, 10))
         sites = [("ASSRT（伪射手）", "https://assrt.net/sub/?" + urllib.parse.urlencode({"searchword": title})),
                  ("SubHD", "https://subhd.tv/search/" + urllib.parse.quote(title, safe="")),
@@ -4212,6 +4306,7 @@ class App:
         win = tk.Toplevel(self.root)
         win.title("恢复待写回成品")
         body, footer = scrollable_window(win, 700, 360)
+        ttk.Label(body, text="待写回成品", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
         ttk.Label(body, text="选择已有成品后重试写回，不重新下载或合成。", wraplength=620).pack(anchor="w")
         choices = ttk.Combobox(body, state="readonly", values=[Path(row["local_output"]).name + " · " + str(i + 1) for i, row in enumerate(rows)])
         choices.pack(fill="x", pady=8)
@@ -4231,7 +4326,7 @@ class App:
         choices.bind("<<ComboboxSelected>>", describe)
         choices.current(len(rows) - 1)
         describe()
-        ttk.Button(footer, text="恢复这个任务", command=select).pack(side="right")
+        ttk.Button(footer, text="恢复这个任务", style="Accent.TButton", command=select).pack(side="right")
         ttk.Button(footer, text="关闭", command=win.destroy).pack(side="right", padx=6)
 
     def retry_copy(self):

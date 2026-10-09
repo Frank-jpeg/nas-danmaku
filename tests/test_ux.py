@@ -458,6 +458,61 @@ class UXGuiTests(UXFixture, unittest.TestCase):
         dialog.preview()
         self.assertEqual(dialog.labels['area'].get(), '顶部 35%')
 
+    def test_local_output_directory_default_cancel_and_saved_choice_survive_restart(self):
+        desktop = d.desktop_directory()
+        self.assertEqual(self.app.output_directory, desktop)
+        self.assertIn(str(desktop), self.app.output_text.get())
+        with patch.object(d.filedialog, 'askdirectory', return_value=''):
+            self.app.output_directory_button.invoke()
+        self.assertEqual(self.app.output_directory, desktop)
+        custom = self.folder / '字幕 成品'
+        custom.mkdir()
+        with patch.object(d.filedialog, 'askdirectory', return_value=str(custom)) as picker:
+            self.app.output_directory_button.invoke()
+        self.assertEqual(picker.call_args.kwargs['initialdir'], str(desktop))
+        self.assertEqual(d.load_output_directory(), custom)
+        result = d.ScanResult(None, dict(title='电影', year='', source='手动片名'), {}, (),
+            subtitles=[d.SubtitleChoice('字幕', 'online', doc=d.parse_srt('1\n00:00:01,000 --> 00:00:03,000\n台词'))],
+            comments=[d.Comment(1, '弹幕')], workspace=self.folder / 'cache')
+        self.app.result = result
+        self.app.sub_box.configure(values=['字幕'])
+        self.app.sub_box.current(0)
+        with patch.object(d.messagebox, 'showinfo'):
+            self.app.generate()
+            self.wait()
+        self.assertEqual(Path(self.app.output_path()).parent, custom)
+        self.assertIn(str(custom), self.app.output_text.get())
+        self.root.destroy()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = d.App(self.root)
+        self.assertEqual(self.app.output_directory, custom)
+        self.assertIn(str(custom), self.app.output_text.get())
+
+    def test_local_directory_change_backup_failure_keeps_prior_setting(self):
+        custom = self.folder / 'new-output'
+        custom.mkdir()
+        d.save_local_json('output.local.json', dict(version=1, directory=str(d.desktop_directory())))
+        original = self.app.output_directory
+        with patch.object(d.filedialog, 'askdirectory', return_value=str(custom)), \
+                patch.object(d.shutil, 'copy2', side_effect=OSError('backup failed')), \
+                patch.object(d.messagebox, 'showerror') as error:
+            self.app.output_directory_button.invoke()
+        error.assert_called_once()
+        self.assertEqual(self.app.output_directory, original)
+        self.assertEqual(d.load_output_directory(), original)
+
+    def test_output_directory_button_is_disabled_during_work_and_for_video_writeback(self):
+        self.app.set_busy(True)
+        self.assertEqual(str(self.app.output_directory_button['state']), 'disabled')
+        self.app.set_busy(False)
+        self.app.result = d.ScanResult(self.folder / 'film.mkv', {}, {}, ())
+        self.app.update_ready()
+        self.assertEqual(str(self.app.output_directory_button['state']), 'disabled')
+        with patch.object(d.filedialog, 'askdirectory') as picker:
+            self.app.choose_output_directory()
+        picker.assert_not_called()
+
     def test_dandan_dialog_prefills_disabled_credentials_and_toggles_secret_visibility(self):
         d.save_local_json('dandanplay.local.json', dict(version=1, app_id='testapp', enabled=False, protected_secret='encrypted'))
         with patch.object(d, 'dandan_protect', return_value='stored-test-secret') as decrypt:

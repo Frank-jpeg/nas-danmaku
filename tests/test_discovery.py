@@ -218,7 +218,7 @@ class AutoTests(unittest.TestCase):
             local = d.synthesize(result)
             self.assertTrue(local['saved'])
             self.assertTrue(local['local_only'])
-            self.assertEqual(Path(local['output']).parent, result.workspace)
+            self.assertEqual(Path(local['output']).parent, d.desktop_directory())
             probe.return_value = self.meta
             attached = d.attach_search_video(result, self.video)
             output = d.synthesize(attached)

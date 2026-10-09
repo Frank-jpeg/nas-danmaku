@@ -155,7 +155,7 @@ class LocalPipelineTests(unittest.TestCase):
             again = d.synthesize(result, offset=1.5)
         self.assertTrue(value['saved'])
         self.assertTrue(value['local_only'])
-        self.assertEqual(Path(value['output']).parent, self.cache)
+        self.assertEqual(Path(value['output']).parent, d.desktop_directory())
         self.assertEqual(Path(value['output']).name, '弹幕版-测试电影.2020.ass')
         self.assertEqual(Path(again['output']).name, '弹幕版-测试电影.2020-v2.ass')
         self.assertEqual(Path(value['output']).read_bytes(), before)
@@ -175,7 +175,7 @@ class LocalPipelineTests(unittest.TestCase):
         result.movies, result.selected_movie_key = [], None
         result.identity['title'] = '../CON:/\\影片*?' + '很长' * 150
         value = d.synthesize(result)
-        self.assertEqual(Path(value['output']).parent, self.cache)
+        self.assertEqual(Path(value['output']).parent, d.desktop_directory())
         self.assertLessEqual(len(Path(value['output']).name), 128)
         d.safe_name(Path(value['output']).name)
 
@@ -199,6 +199,53 @@ class LocalPipelineTests(unittest.TestCase):
                 patch.object(d, 'remember_output') as remember, self.assertRaisesRegex(OSError, '磁盘写入失败'):
             d.synthesize(result)
         remember.assert_not_called()
+
+    def test_custom_local_directory_gets_final_ass_and_preserves_existing_names(self):
+        result = self.result()
+        result.video, result.signature = None, ()
+        chosen = self.folder / '我的字幕 成品'
+        chosen.mkdir()
+        existing = chosen / d.synthesis_filename(result)
+        existing.write_bytes(b'keep original')
+        value = d.synthesize(result, output_dir=chosen)
+        self.assertEqual(Path(value['output']).parent, chosen)
+        self.assertTrue(value['output'].endswith('-v2.ass'))
+        self.assertEqual(value['target'], value['output'])
+        self.assertEqual(value['local_output'], value['output'])
+        self.assertEqual(existing.read_bytes(), b'keep original')
+        self.assertTrue(d.parse_ass(Path(value['output']).read_text(encoding='utf-8')).events)
+        self.assertEqual(list(chosen.glob('*.part')), [])
+        self.assertEqual(list(d.desktop_directory().iterdir()), [])
+        # Attaching a video keeps the established write-back destination.
+        result.video, result.signature = self.video, d.file_signature(self.video)
+        attached = d.synthesize(result, output_dir=chosen)
+        self.assertEqual(Path(attached['output']).parent, self.nas)
+
+    def test_missing_custom_directory_fails_without_falling_back_to_desktop(self):
+        result = self.result()
+        result.video, result.signature = None, ()
+        missing = self.folder / '已移除的目录'
+        with self.assertRaisesRegex(d.ToolError, '更改目录'):
+            d.synthesize(result, output_dir=missing)
+        self.assertFalse(missing.exists())
+        self.assertEqual(list(d.desktop_directory().iterdir()), [])
+
+    def test_custom_directory_publish_failure_keeps_cache_without_partial_ass(self):
+        result = self.result()
+        result.video, result.signature = None, ()
+        chosen = self.folder / '只读目录'
+        chosen.mkdir()
+        original = Path.open
+        def denied(path, *args, **kwargs):
+            if path.parent == chosen:
+                raise PermissionError('无写入权限')
+            return original(path, *args, **kwargs)
+        with patch.object(Path, 'open', denied), patch.object(d, 'remember_output') as remember:
+            with self.assertRaisesRegex(d.ToolError, '合成缓存仍保留在'):
+                d.synthesize(result, output_dir=chosen)
+        remember.assert_not_called()
+        self.assertTrue((self.cache / d.synthesis_filename(result)).is_file())
+        self.assertEqual(list(chosen.iterdir()), [])
 
     def test_failed_rename_never_reports_copy_complete(self):
         source = self.cache / 'out.ass'

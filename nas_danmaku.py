@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.12.0"
+VERSION = "2.13.0"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -765,6 +765,38 @@ def store_preferences(settings, density, offsets):
                                                     offsets=dict(list(offsets.items())[-200:])))
 
 
+def desktop_directory():
+    """Respect Windows desktop redirection, including OneDrive and other drives."""
+    if os.name == "nt":
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as key:
+                folder = Path(os.path.expandvars(winreg.QueryValueEx(key, "Desktop")[0]))
+                if folder.is_absolute():
+                    return folder
+        except (OSError, TypeError, ValueError):
+            pass
+    return Path.home() / "Desktop"
+
+
+def load_output_directory():
+    data = load_local_json("output.local.json", {"version": 1})
+    value = data.get("directory")
+    if value is None:
+        return desktop_directory()
+    if not isinstance(value, str) or not value or "\0" in value or not Path(value).is_absolute():
+        raise ToolError("已保存的本机输出目录格式错误，请重新选择保存目录。")
+    return Path(value)
+
+
+def checked_output_directory(value):
+    folder = Path(value)
+    if not folder.is_absolute() or not folder.is_dir():
+        raise ToolError("保存目录不存在或无法访问，请点击“更改目录”重新选择：" + str(folder))
+    return folder
+
+
 def pending_outputs():
     data = load_local_json("pending-outputs.local.json", {"version": 1, "items": []})
     rows = data.get("items")
@@ -1059,10 +1091,11 @@ HELP = "字幕弹幕一键合成 v" + VERSION + """（单文件）
 使用：选择影片 → 自动识别片名、字幕及弹幕 → 核对下面的结果 → 确认合成。
 也可直接在“电影名称”输入片名（可带年份，如“楚门的世界 1998”），按回车或点“按片名搜索”。
 未选影片也能搜索、切换来源及补选字幕/弹幕；取得两者后点“生成到本机”，不需要影片文件。
-本机成品按片名和年份命名，可打开成品文件夹或复制路径；请自行核对电影版本和字幕时间轴。
+本机成品默认保存到桌面，可在“调整与生成”中点“更改目录”，下次自动记住。
+成品按片名和年份命名，可打开成品文件夹或复制路径；请自行核对电影版本和字幕时间轴。
 之后选择影片文件会保留查询结果，仍可按影片文件名合成并写回原目录。
 影片路径暂不可访问时，按片名搜索仍可继续；未选文件时跳过外挂、内封和文件指纹查询。
-输出：已选影片时写回影片原目录 / 弹幕版-影片完整文件名.ass；未选影片时保存在本机缓存目录。
+输出：已选影片时写回影片原目录 / 弹幕版-影片完整文件名.ass；未选影片时保存到所选本机目录（默认桌面）。
 未选影片时不会猜测片长或按台词结束时间截断弹幕。同名文件自动加 -v2，不覆盖原文件。
 
 只需要这一个 .py；Python 3.10+（含 Tkinter）。读取影片信息和内封文字字幕需要先安装 ffprobe/ffmpeg，并确保可在命令行中运行。
@@ -1076,7 +1109,7 @@ ZIP 字幕包直接读取；7z/RAR 包需要本机已有 7-Zip。只下载现成
 台词和弹幕先缓存到本机，合成后仅将最终 ASS 写回 NAS；不下载整部视频。
 NAS 写回失败会保留本机成品和待写回记录，重启后可恢复；“待写回任务”可选择其他任务。
 可以打开成品文件夹、复制路径。重试只写回原任务，不使用当前新影片的目录。
-缓存和成品保存在 %LOCALAPPDATA%/NasDanmaku/cache，界面日志会显示具体目录。
+下载与合成缓存保存在 %LOCALAPPDATA%/NasDanmaku/cache，本机成品另存到所选目录，界面显示具体路径。
 
 弹幕：按片名通过 360 影视查找电影平台链接，B 站优先直连合并 XML 与分段，其他平台向公开弹幕库按需请求；不需要你填密钥。
 选中电影后，自动核实其已找到链接的各个平台，显示来源和实际取得的原始弹幕条数。
@@ -2828,11 +2861,13 @@ def synthesis_filename(result):
 
 def synthesize(result, subtitle_index=0, offset=0, density=6, duration=DEFAULT_DANMAKU_DURATION, font_size=32, progress=lambda _: None,
                *, area=25, opacity=80, block_scroll=False, block_fixed=True, block_color=False,
-               avoid_subtitles=True, deduplicate=True, block_noise=True, block_keywords="", filter_rules=None):
+               avoid_subtitles=True, deduplicate=True, block_noise=True, block_keywords="", filter_rules=None, output_dir=None):
     if not result.subtitles or not 0 <= subtitle_index < len(result.subtitles):
         raise ToolError("还没有可合成的文字字幕。")
     if not result.comments and result.dm_ass is None:
         raise ToolError("还没有取得弹幕，暂时无法合成。")
+    destination = result.video.parent if result.video is not None else checked_output_directory(
+        output_dir if output_dir is not None else desktop_directory())
     if result.workspace is None:
         result.workspace = local_workspace()
     choice = result.subtitles[subtitle_index]
@@ -2863,7 +2898,7 @@ def synthesize(result, subtitle_index=0, offset=0, density=6, duration=DEFAULT_D
         filter_stats["time"] += len(result.comments) - len(comments)
     progress("合并台词和弹幕")
     final = merge_ass(base, dm)
-    target = (result.video.parent if result.video is not None else result.workspace) / synthesis_filename(result)
+    target = destination / synthesis_filename(result)
     output = save_new(result.workspace / target.name, final.dumps(), progress, "在本机保存合成字幕")
     value = {"output": str(output), "local_output": str(output), "video": str(result.video) if result.video is not None else "",
              "signature": result.signature, "target": str(target), "subtitle_lines": len(base.events),
@@ -2872,7 +2907,12 @@ def synthesize(result, subtitle_index=0, offset=0, density=6, duration=DEFAULT_D
     value["filter_stats"] = filter_stats
     value["raw_count"] = len(result.dm_ass.events) if result.dm_ass is not None else len(result.comments)
     if result.video is None:
-        value.update(saved=True, local_only=True, target=str(output), write_error="")
+        try:
+            published = copy_to_video_dir(output, target, progress, message="保存到所选本机目录")
+        except (OSError, ToolError) as exc:
+            raise ToolError("保存到所选目录失败：" + str(exc) + "\n合成缓存仍保留在：" + str(output)) from exc
+        value.update(output=str(published), local_output=str(published), saved=True,
+                     local_only=True, target=str(published), write_error="")
         progress("本机合成完成；请核对电影版本和字幕时间轴。")
         return value
     return publish_cached(value, progress)
@@ -2904,9 +2944,8 @@ def publish_cached(value, progress=lambda _: None):
     return value
 
 
-def copy_to_video_dir(source, target, progress=None):
+def copy_to_video_dir(source, target, progress=None, *, message="写回影片原目录"):
     total = source.stat().st_size
-    message = "写回影片原目录"
     report(progress, message, 0, total, "字节")
     # 先上传 .part，完整关闭后才发布为 ASS；断线不会暴露半份字幕。
     temporary = target.with_name(".nas-danmaku-" + uuid.uuid4().hex + ".part")
@@ -2920,12 +2959,12 @@ def copy_to_video_dir(source, target, progress=None):
                 while offset < len(chunk):
                     count = outgoing.write(chunk[offset:])
                     if not count:
-                        raise OSError("NAS 写入中断。")
+                        raise OSError("目标目录写入中断。")
                     offset += count
                     copied += count
                     report(progress, message, copied, total, "字节")
             if copied != total:
-                raise ToolError("本地合成文件大小发生变化，未发布到 NAS。")
+                raise ToolError("本地合成文件大小发生变化，未发布到目标目录。")
         for version in range(1, 10000):
             candidate = target if version == 1 else target.with_name(f"{target.stem}-v{version}{target.suffix}")
             try:
@@ -3499,6 +3538,13 @@ class App:
         except (ToolError, OSError) as exc:
             rule_warning = str(exc)
             self.preferences_readable = False
+        self.output_directory = desktop_directory()
+        self.output_directory_readable = True
+        try:
+            self.output_directory = load_output_directory()
+        except (ToolError, OSError) as exc:
+            rule_warning += "\n" + str(exc)
+            self.output_directory_readable = False
         try:
             recovered = pending_outputs()
             self.pending_output = recovered[-1] if recovered else None
@@ -3518,7 +3564,7 @@ class App:
         self.dandan_summary = tk.StringVar()
         self.refresh_dandan_status()
         self.settings_summary = tk.StringVar(value=self.settings_description())
-        self.output_text = tk.StringVar(value="未选择影片时生成到本机；选影片后可写回原目录。")
+        self.output_text = tk.StringVar(value="本机保存目录：" + str(self.output_directory))
         self.result_summary = tk.StringVar()
         setup_ui_theme(root)
         head = ttk.Frame(root, padding=(16, 8))
@@ -3593,7 +3639,12 @@ class App:
         self.settings_button = ttk.Button(row, text="弹幕设置…", command=self.open_settings)
         self.settings_button.pack(side="right")
         ttk.Label(settings, textvariable=self.settings_summary, style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
-        wrapped_label(settings, textvariable=self.output_text)
+        row = ttk.Frame(settings)
+        row.pack(fill="x", pady=(6, 0))
+        self.output_entry = ttk.Entry(row, textvariable=self.output_text, state="readonly")
+        self.output_entry.pack(side="left", fill="x", expand=True)
+        self.output_directory_button = ttk.Button(row, text="更改目录…", command=self.choose_output_directory)
+        self.output_directory_button.pack(side="right", padx=(8, 0))
 
         details = ui_section(sidebar, "当前弹幕")
         wrapped_label(details, textvariable=self.dm_text, foreground=UI_COLORS["accent"])
@@ -3840,6 +3891,24 @@ class App:
         self.retry_sources_button.configure(state="normal" if not self.busy and has_platforms else "disabled")
         self.settings_button.configure(state="disabled" if self.busy or (self.result and self.result.dm_ass) else "normal")
         self.embedded_button.configure(state="normal" if has_video and not self.busy else "disabled")
+        self.output_directory_button.configure(state="disabled" if self.busy or has_video else "normal")
+
+    def choose_output_directory(self):
+        if self.busy or (self.result and self.result.video is not None):
+            return
+        selected = filedialog.askdirectory(parent=self.root, title="选择本机成品保存目录", mustexist=True,
+                                           initialdir=str(self.output_directory))
+        if not selected:
+            return
+        try:
+            folder = checked_output_directory(selected)
+            save_local_json("output.local.json", dict(version=1, directory=str(folder)))
+        except (ToolError, OSError, ValueError) as exc:
+            return messagebox.showerror("保存目录未更改", str(exc), parent=self.root)
+        self.output_directory = folder
+        self.output_directory_readable = True
+        self.output_text.set("本机保存目录：" + str(folder))
+        self.status.set("保存目录已记住，下次生成到这里；已有成品保留在原位置。")
 
     def background(self, work, done, *, cancellable=False):
         if self.busy:
@@ -4036,7 +4105,7 @@ class App:
         year = result.identity.get("year") or "未知"
         if result.video is None:
             self.identity_text.set(f"按片名搜索 · 年份：{year} · 尚未选择影片文件")
-            self.output_text.set("输出到本机缓存目录；生成后可打开成品文件夹。")
+            self.output_text.set("本机保存目录：" + str(self.output_directory))
         else:
             length = float(result.metadata.get("format", {}).get("duration", 0) or 0)
             length_text = f"约 {length / 60:.1f} 分钟" if length else "未知"
@@ -4231,11 +4300,17 @@ class App:
                     raise ToolError("路径已经改变，请点击“识别”重新读取后再合成。")
             index = self.sub_box.current()
             offset, density = finite(self.offset.get()), int(self.density.get())
+            output_dir = None
+            if r.video is None:
+                if not self.output_directory_readable:
+                    raise ToolError("原保存目录设置读取失败，请点击“更改目录”核对并重新选择。")
+                output_dir = checked_output_directory(self.output_directory)
             self.save_current_preferences()
         except (ToolError, ValueError, OSError) as exc:
             return messagebox.showerror("请检查输入", str(exc))
         settings = dict(self.render_settings)
-        self.background(lambda: synthesize(r, index, offset, density, progress=self.progress, **settings), self.show_output)
+        self.background(lambda: synthesize(r, index, offset, density, progress=self.progress,
+                                          output_dir=output_dir, **settings), self.show_output)
 
     def show_output(self, value):
         self.last_output = value

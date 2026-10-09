@@ -32,13 +32,13 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.13.0"
-DEFAULT_DANMAKU_DURATION = 12
+VERSION = "2.13.1"
+DEFAULT_DANMAKU_DURATION = 12  # 1× speed reference; the UI preference defaults to 0.5×.
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
 EVENT_FIELDS = "Layer Start End Style Name MarginL MarginR MarginV Effect Text".split()
 TEXT_CODECS = {"ass", "ssa", "subrip", "srt", "mov_text", "text", "webvtt"}
-DM_DEFAULTS = dict(font_size=32, duration=DEFAULT_DANMAKU_DURATION, area=25, opacity=80, block_scroll=False,
+DM_DEFAULTS = dict(font_size=50, duration=DEFAULT_DANMAKU_DURATION * 2, area=25, opacity=80, block_scroll=False,
                    block_fixed=True, block_color=False, avoid_subtitles=True, deduplicate=True,
                    block_noise=True, block_keywords="", filter_rules=None)
 
@@ -1135,8 +1135,8 @@ B 站直连失败后使用第三方缓存，会标注“第三方缓存，可重
 
 识别结果需核对片名、年份、时长，平台上架年份有时与上映年不同。
 弹幕偏移：正数延后、负数提前。不同剪辑版本可能无法只用一个偏移完全对齐。
-默认弹幕只在顶部 1/4 滚动，字号 32（1080p 基准）、不透明度 80%、最多同屏 6 条，屏蔽固定弹幕。
-默认 1× 每条滚动 12 秒，比旧版 8 秒慢约三分之一；0.5× 为 24 秒，2× 为 6 秒。
+默认弹幕只在顶部 1/4 滚动，字号 50（1080p 基准）、不透明度 80%、最多同屏 6 条，屏蔽固定弹幕。
+默认速度 0.5×，每条滚动 24 秒；1× 为 12 秒，2× 为 6 秒。“恢复默认”也使用字号50和0.5×。
 同向弹幕留够安全间距即可接续进入，按同屏上限分散进入节奏，不再等待整批走完；原时间点不后移。
 默认过滤日期/时间打卡、报几刷、陪谁看、在吗/有人吗、重复字母数字及明显广告；“弹幕设置”可关闭。
 在“弹幕设置 → 屏蔽规则（内置＋自定义）”查看全部六条内置规则，可修改、停用、删除或恢复默认。
@@ -3470,7 +3470,7 @@ class DanmakuSettingsDialog:
             if key not in ("duration", "filter_rules"):
                 self.variables[key].set(value)
         self.rule_rows = default_filter_rules()
-        self.variables["speed"].set(100)
+        self.variables["speed"].set(DEFAULT_DANMAKU_DURATION * 100 / DM_DEFAULTS["duration"])
         self.variables["density"].set("6")
         self.keyword_button.configure(text="屏蔽规则（内置＋自定义）…")
         self.preview()

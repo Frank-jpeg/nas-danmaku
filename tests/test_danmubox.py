@@ -70,12 +70,17 @@ class DanmuboxTests(unittest.TestCase):
                 patch.object(d, 'decode_danmubox_index', return_value=INDEX_TEXT):
             first = d.danmubox_catalog()
         self.assertEqual(network.call_count, 2)
-        with patch.object(d, 'web_bytes', side_effect=AssertionError('不能重复查目录')):
-            self.assertEqual(d.danmubox_catalog(), first)
         cache = self.folder / 'NasDanmaku' / 'cache' / 'danmubox' / 'catalog.json'
+        # The Windows runner's file clock can lead time.time() briefly. Pin
+        # cache age so this tests fresh/stale behavior, not clock alignment.
+        now = cache.stat().st_mtime + 1
+        with patch.object(d.time, 'time', return_value=now), \
+                patch.object(d, 'web_bytes', side_effect=AssertionError('不能重复查目录')):
+            self.assertEqual(d.danmubox_catalog(), first)
         os.utime(cache, (0, 0))
         updates = []
-        with patch.object(d, 'web_bytes', side_effect=d.ToolError('离线')):
+        with patch.object(d.time, 'time', return_value=now), \
+                patch.object(d, 'web_bytes', side_effect=d.ToolError('离线')):
             self.assertEqual(d.danmubox_catalog(updates.append), first)
         self.assertTrue(any('旧目录' in update.message for update in updates))
 

@@ -284,11 +284,24 @@ class UXGuiTests(UXFixture, unittest.TestCase):
         self.assertTrue(self.app.title_entry.bind('<Return>'))
         self.assertEqual(self.app.path.get(), '')
         self.assertIn('尚未选择影片文件', self.app.identity_text.get())
-        self.assertEqual(str(self.app.generate_button['state']), 'disabled')
+        self.assertEqual(str(self.app.generate_button['state']), 'normal')
+        self.assertEqual(self.app.generate_button['text'], '生成到本机')
         self.assertEqual(str(self.app.embedded_button['state']), 'disabled')
-        with patch.object(d, 'synthesize') as generate:
+        pending = dict(local_output='older.ass', video='older.mkv', target='older-target.ass', signature=(1, 2))
+        self.app.pending_output = pending
+        with patch.object(d, 'file_signature', side_effect=AssertionError('无影片不应检查签名')), \
+                patch.object(d, 'publish_cached', side_effect=AssertionError('无影片不应写回')), \
+                patch.object(d.messagebox, 'showinfo') as message:
             self.app.generate()
-        generate.assert_not_called()
+            self.wait()
+        self.assertTrue(self.app.last_output['local_only'])
+        self.assertTrue(self.app.last_output['saved'])
+        self.assertTrue(Path(self.app.output_path()).is_file())
+        self.assertIn('本机', message.call_args.args[0])
+        self.assertIn('本机', self.app.status.get())
+        self.assertEqual(str(self.app.open_output_button['state']), 'normal')
+        self.assertIs(self.app.pending_output, pending)
+        self.assertEqual(d.pending_outputs(), [])
         self.app.save_current_preferences()
         self.assertFalse(self.app.saved_offsets)
         self.app.sub_box.current(1)

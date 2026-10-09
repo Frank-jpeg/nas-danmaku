@@ -215,8 +215,10 @@ class AutoTests(unittest.TestCase):
             self.assertTrue(result.comments)
             self.assertTrue(result.subtitles[0].doc.events)
             self.assertTrue(any(r.subtitles for r in snapshots))
-            with self.assertRaisesRegex(d.ToolError, '选择影片文件'):
-                d.synthesize(result)
+            local = d.synthesize(result)
+            self.assertTrue(local['saved'])
+            self.assertTrue(local['local_only'])
+            self.assertEqual(Path(local['output']).parent, result.workspace)
             probe.return_value = self.meta
             attached = d.attach_search_video(result, self.video)
             output = d.synthesize(attached)

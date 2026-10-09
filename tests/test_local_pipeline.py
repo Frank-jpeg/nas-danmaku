@@ -137,6 +137,69 @@ class LocalPipelineTests(unittest.TestCase):
         self.assertFalse(list(self.nas.glob('*.ass')))
         self.assertFalse(list(self.nas.glob('*.part')))
 
+    def test_no_video_synthesis_stays_local_keeps_late_comments_and_existing_pending_jobs(self):
+        result = self.result()
+        result.video, result.signature = None, ()
+        result.comments.append(d.Comment(100, '台词结束后的弹幕'))
+        pending = dict(local_output=str(self.cache / 'older.ass'), video=str(self.video),
+                       signature=d.file_signature(self.video), target=str(self.nas / 'older.ass'), saved=False)
+        d.remember_output(pending)
+        previous_pending = d.pending_outputs()
+        with patch.object(d, 'file_signature', side_effect=AssertionError('不能检查影片')), \
+                patch.object(d, 'extract_subtitle', side_effect=AssertionError('不能提取影片')), \
+                patch.object(d, 'web_bytes', side_effect=AssertionError('不能联网')), \
+                patch.object(d, 'remember_output', side_effect=AssertionError('不应修改待写回任务')), \
+                patch.object(d, 'publish_cached', side_effect=AssertionError('不应写回')):
+            value = d.synthesize(result, offset=1.5)
+            before = Path(value['output']).read_bytes()
+            again = d.synthesize(result, offset=1.5)
+        self.assertTrue(value['saved'])
+        self.assertTrue(value['local_only'])
+        self.assertEqual(Path(value['output']).parent, self.cache)
+        self.assertEqual(Path(value['output']).name, '弹幕版-测试电影.2020.ass')
+        self.assertEqual(Path(again['output']).name, '弹幕版-测试电影.2020-v2.ass')
+        self.assertEqual(Path(value['output']).read_bytes(), before)
+        parsed = d.parse_ass(before.decode('utf-8'))
+        self.assertEqual(len(parsed.events), 16)
+        late = next(row for row in parsed.events if '台词结束后的弹幕' in row['Text'])
+        self.assertEqual(late['Start'], '0:01:41.50')
+        self.assertEqual(d.pending_outputs(), previous_pending)
+        self.assertEqual(list(self.nas.iterdir()), [self.video])
+
+    def test_local_filename_uses_selected_movie_and_cannot_escape_workspace(self):
+        result = self.result()
+        result.video, result.signature = None, ()
+        movie = dict(title='让子弹飞', year='2010', links={'qq': 'https://v.qq.com/test'})
+        result.movies, result.selected_movie_key = [movie], d.movie_source_key(movie)
+        self.assertEqual(Path(d.synthesize(result)['output']).name, '弹幕版-让子弹飞.2010.ass')
+        result.movies, result.selected_movie_key = [], None
+        result.identity['title'] = '../CON:/\\影片*?' + '很长' * 150
+        value = d.synthesize(result)
+        self.assertEqual(Path(value['output']).parent, self.cache)
+        self.assertLessEqual(len(Path(value['output']).name), 128)
+        d.safe_name(Path(value['output']).name)
+
+    def test_local_synthesis_requires_both_inputs_and_reports_save_failures(self):
+        result = self.result()
+        result.video, result.signature = None, ()
+        subtitles, comments = result.subtitles, result.comments
+        result.subtitles = []
+        with self.assertRaisesRegex(d.ToolError, '文字字幕'):
+            d.synthesize(result)
+        result.subtitles, result.comments = subtitles, []
+        with self.assertRaisesRegex(d.ToolError, '弹幕'):
+            d.synthesize(result)
+        result.comments = comments
+        result.subtitles = [d.SubtitleChoice('内封', 'embedded', index=1)]
+        with patch.object(d, 'file_signature') as signature, self.assertRaisesRegex(d.ToolError, '内封字幕需要影片文件'):
+            d.synthesize(result)
+        signature.assert_not_called()
+        result.subtitles = subtitles
+        with patch.object(d, 'save_new', side_effect=OSError('磁盘写入失败')), \
+                patch.object(d, 'remember_output') as remember, self.assertRaisesRegex(OSError, '磁盘写入失败'):
+            d.synthesize(result)
+        remember.assert_not_called()
+
     def test_failed_rename_never_reports_copy_complete(self):
         source = self.cache / 'out.ass'
         source.write_text(SRT, encoding='utf-8')

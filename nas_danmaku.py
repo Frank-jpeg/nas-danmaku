@@ -32,7 +32,7 @@ import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace as dataclass_replace
 
-VERSION = "2.10.2"
+VERSION = "2.11.0"
 DEFAULT_DANMAKU_DURATION = 12
 MAX_BYTES = 32 * 1024 * 1024
 STYLE_FIELDS = "Name Fontname Fontsize PrimaryColour SecondaryColour OutlineColour BackColour Bold Italic Underline StrikeOut ScaleX ScaleY Spacing Angle BorderStyle Outline Shadow Alignment MarginL MarginR MarginV Encoding".split()
@@ -1058,9 +1058,12 @@ HELP = "字幕弹幕一键合成 v" + VERSION + """（单文件）
 
 使用：选择影片 → 自动识别片名、字幕及弹幕 → 核对下面的结果 → 确认合成。
 也可直接在“电影名称”输入片名（可带年份，如“楚门的世界 1998”），按回车或点“按片名搜索”。
-未选影片也能搜索、切换来源及补选字幕/弹幕；之后选择影片文件会保留查询结果，再核对版本并合成。
+未选影片也能搜索、切换来源及补选字幕/弹幕；取得两者后点“生成到本机”，不需要影片文件。
+本机成品按片名和年份命名，可打开成品文件夹或复制路径；请自行核对电影版本和字幕时间轴。
+之后选择影片文件会保留查询结果，仍可按影片文件名合成并写回原目录。
 影片路径暂不可访问时，按片名搜索仍可继续；未选文件时跳过外挂、内封和文件指纹查询。
-输出：影片原目录 / 弹幕版-影片完整文件名.ass。同名则自动加 -v2，不覆盖原文件。
+输出：已选影片时写回影片原目录 / 弹幕版-影片完整文件名.ass；未选影片时保存在本机缓存目录。
+未选影片时不会猜测片长或按台词结束时间截断弹幕。同名文件自动加 -v2，不覆盖原文件。
 
 只需要这一个 .py；Python 3.10+（含 Tkinter）。读取影片信息和内封文字字幕需要先安装 ffprobe/ffmpeg，并确保可在命令行中运行。
 路径必须是 Windows 能读取的本地/映射盘/UNC 路径。极空间 App 里的虚拟路径或分享链接不能直接当文件路径。
@@ -2646,7 +2649,7 @@ def scan_movie(video, override="", progress=lambda _: None, on_update=None):
         except (ToolError, OSError) as exc:
             if not override:
                 raise
-            warnings.append("影片文件暂不可用，已改为只按片名搜索；合成前请重新选择影片。" + str(exc))
+            warnings.append("影片文件暂不可用，已改为只按片名搜索；可生成到本机，需写回时再选择影片。" + str(exc))
             video = None
     else:
         video = None
@@ -2812,11 +2815,20 @@ def materialize_subtitle(choice, video, progress=None, duration=None):
     return doc
 
 
+def synthesis_filename(result):
+    if result.video is not None:
+        return f"弹幕版-{result.video.stem}.ass"
+    movie = next((movie for movie in result.movies if movie_source_key(movie) == result.selected_movie_key), {})
+    title = movie.get("official_title") or movie.get("title") or result.identity.get("title") or "电影"
+    year = movie.get("year") or result.identity.get("year") or ""
+    name = str(title) + ("." + str(year) if year else "")
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)[:120].strip(" .") or "电影"
+    return f"弹幕版-{name}.ass"
+
+
 def synthesize(result, subtitle_index=0, offset=0, density=6, duration=DEFAULT_DANMAKU_DURATION, font_size=32, progress=lambda _: None,
                *, area=25, opacity=80, block_scroll=False, block_fixed=True, block_color=False,
                avoid_subtitles=True, deduplicate=True, block_noise=True, block_keywords="", filter_rules=None):
-    if result.video is None:
-        raise ToolError("当前仅按片名搜索，请先选择影片文件，再确认合成。")
     if not result.subtitles or not 0 <= subtitle_index < len(result.subtitles):
         raise ToolError("还没有可合成的文字字幕。")
     if not result.comments and result.dm_ass is None:
@@ -2824,10 +2836,13 @@ def synthesize(result, subtitle_index=0, offset=0, density=6, duration=DEFAULT_D
     if result.workspace is None:
         result.workspace = local_workspace()
     choice = result.subtitles[subtitle_index]
-    if choice.kind == "embedded" and choice.doc is None and file_signature(result.video) != result.signature:
-        raise ToolError("影片在识别后发生了变化，请重新选择识别。")
+    if choice.kind == "embedded" and choice.doc is None:
+        if result.video is None:
+            raise ToolError("内封字幕需要影片文件；可先补选 SRT/ASS，再生成到本机。")
+        if file_signature(result.video) != result.signature:
+            raise ToolError("影片在识别后发生了变化，请重新选择识别。")
     progress("正在本机准备原台词字幕…" if choice.kind != "embedded" or choice.doc is not None else "手动提取内封字幕（需要读取影片）…")
-    length = finite(result.metadata.get("format", {}).get("duration", 0) or 0, "影片时长")
+    length = finite(result.metadata.get("format", {}).get("duration", 0) or 0, "影片时长") if result.video is not None else 0
     base = materialize_subtitle(result.subtitles[subtitle_index], result.video, progress=progress, duration=length)
     save_new(result.workspace / "selected-subtitle.ass", base.dumps(), progress, "缓存所选字幕到本机")
     progress("正在排列弹幕并合并台词…")
@@ -2848,14 +2863,18 @@ def synthesize(result, subtitle_index=0, offset=0, density=6, duration=DEFAULT_D
         filter_stats["time"] += len(result.comments) - len(comments)
     progress("合并台词和弹幕")
     final = merge_ass(base, dm)
-    target = result.video.with_name(f"弹幕版-{result.video.stem}.ass")
+    target = (result.video.parent if result.video is not None else result.workspace) / synthesis_filename(result)
     output = save_new(result.workspace / target.name, final.dumps(), progress, "在本机保存合成字幕")
-    value = {"output": str(output), "local_output": str(output), "video": str(result.video),
+    value = {"output": str(output), "local_output": str(output), "video": str(result.video) if result.video is not None else "",
              "signature": result.signature, "target": str(target), "subtitle_lines": len(base.events),
              "danmaku_lines": len(dm.events), "filtered": filtered,
              "noise_filtered": filter_stats["noise"], "keyword_filtered": filter_stats["keywords"]}
     value["filter_stats"] = filter_stats
     value["raw_count"] = len(result.dm_ass.events) if result.dm_ass is not None else len(result.comments)
+    if result.video is None:
+        value.update(saved=True, local_only=True, target=str(output), write_error="")
+        progress("本机合成完成；请核对电影版本和字幕时间轴。")
+        return value
     return publish_cached(value, progress)
 
 
@@ -3438,7 +3457,7 @@ class App:
         ttk.Button(head, text="使用说明", command=self.help).pack(side="right")
         ttk.Button(head, text="网页找字幕", command=self.subtitle_sites).pack(side="right", padx=6)
         ttk.Button(head, textvariable=self.dandan_summary, command=self.open_dandan_settings).pack(side="right", padx=6)
-        ttk.Label(p, text="可直接输入片名搜索；合成前选择影片文件。", foreground="#606975").pack(anchor="w", pady=(2, 6))
+        ttk.Label(p, text="可按片名搜索并生成到本机；选影片后可写回原目录。", foreground="#606975").pack(anchor="w", pady=(2, 6))
         row = ttk.Frame(p)
         row.pack(fill="x")
         self.path_entry = ttk.Entry(row, textvariable=self.path)
@@ -3714,9 +3733,10 @@ class App:
 
     def update_ready(self):
         has_video = self.result is not None and self.result.video is not None
-        ready = (not self.busy or self.cancellable) and has_video and bool(self.result.subtitles) and bool(self.result.comments or self.result.dm_ass)
+        ready = (not self.busy or self.cancellable) and self.result is not None and bool(self.result.subtitles) and bool(self.result.comments or self.result.dm_ass)
         self.generate_button.configure(state="normal" if ready else "disabled")
-        self.generate_button.configure(text="使用已取得结果合成" if self.busy and self.cancellable and ready else "确认合成并写回")
+        self.generate_button.configure(text="使用已取得结果合成" if self.busy and self.cancellable and ready else
+                                       "确认合成并写回" if has_video else "生成到本机")
         self.cancel_button.configure(state="normal" if self.busy and self.cancellable else "disabled")
         self.open_output_button.configure(state="normal" if self.last_output else "disabled")
         self.copy_path_button.configure(state="normal" if self.last_output else "disabled")
@@ -3906,7 +3926,8 @@ class App:
                     self.log("提示：" + warning)
                 self.log("本地缓存：" + str(result.workspace))
                 if result.video is None:
-                    self.status.set("片名搜索完成；合成前请选择影片文件，已找到的结果会保留。")
+                    self.status.set("片名搜索完成；可生成到本机，也可选择影片后写回原目录。" if result.subtitles and (result.comments or result.dm_ass)
+                                    else "片名搜索完成，仍有缺失项；请查看提示或补选字幕/弹幕。")
                 else:
                     self.status.set("已找到字幕和弹幕，请核对后确认合成。" if result.subtitles and (result.comments or result.dm_ass) else "识别结束，仍有缺失项，请查看提示。")
             else:
@@ -3921,7 +3942,7 @@ class App:
         year = result.identity.get("year") or "未知"
         if result.video is None:
             self.identity_text.set(f"按片名搜索 · 年份：{year} · 尚未选择影片文件")
-            self.output_text.set("合成前请选择影片文件；已查询的字幕和弹幕会保留。")
+            self.output_text.set("输出到本机缓存目录；生成后可打开成品文件夹。")
         else:
             length = float(result.metadata.get("format", {}).get("duration", 0) or 0)
             length_text = f"约 {length / 60:.1f} 分钟" if length else "未知"
@@ -4070,7 +4091,7 @@ class App:
                 r.subtitles.insert(0, choice)
                 self.sub_box.configure(values=[c.label for c in r.subtitles])
                 self.sub_box.current(0)
-                self.status.set("字幕已导入并缓存。" + ("请选择影片文件后合成。" if r.video is None else "可以合成。"))
+                self.status.set("字幕已导入并缓存。" + ("可生成到本机。" if r.video is None else "可以合成。"))
                 self.update_ready()
             self.background(work, done)
 
@@ -4099,23 +4120,21 @@ class App:
                 self.result = result
                 self.platform.set("手动导入")
                 self.show_danmaku()
-                self.status.set("弹幕已导入并缓存。" + ("请选择影片文件后合成。" if result.video is None else "可以合成。"))
+                self.status.set("弹幕已导入并缓存。" + ("可生成到本机。" if result.video is None else "可以合成。"))
                 self.update_ready()
             self.background(work, done)
 
     def generate(self):
-        if self.result is not None and self.result.video is None:
-            self.status.set("当前仅按片名搜索，请先选择影片文件，再确认合成。")
-            return
         if self.busy and self.cancellable and self.result and self.result.subtitles and (self.result.comments or self.result.dm_ass):
             self.cancel_task()
         r = self.result
         if self.busy or r is None:
             return
         try:
-            current = os.path.normcase(os.path.abspath(self.path.get().strip().strip('"')))
-            if current != os.path.normcase(str(r.video)):
-                raise ToolError("路径已经改变，请点击“识别”重新读取后再合成。")
+            if r.video is not None:
+                current = os.path.normcase(os.path.abspath(self.path.get().strip().strip('"')))
+                if current != os.path.normcase(str(r.video)):
+                    raise ToolError("路径已经改变，请点击“识别”重新读取后再合成。")
             index = self.sub_box.current()
             offset, density = finite(self.offset.get()), int(self.density.get())
             self.save_current_preferences()
@@ -4138,7 +4157,11 @@ class App:
         self.log(summary)
         if value.get("recovery_warning"):
             self.log(value["recovery_warning"])
-        if value.get("saved", True):
+        if value.get("local_only"):
+            self.status.set("合成完成，已保存到本机；可打开成品文件夹，核对版本和时间轴后使用。")
+            self.output_text.set("本机成品：" + value["output"])
+            messagebox.showinfo("本机合成完成", value["output"] + "\n\n可用“打开成品文件夹”找到文件。\n尚未核验影片版本和片长，请检查字幕时间轴后使用。")
+        elif value.get("saved", True):
             self.pending_output = None
             self.status.set("合成完成，已保存到影片原目录。")
             self.output_text.set("已保存：" + value["output"])

@@ -1259,8 +1259,9 @@ def save_dandan_config(app_id, secret, enabled):
         if len(secret) > 4096 or any(c.isspace() for c in secret):
             raise ToolError("AppSecret 格式不正确，请重新粘贴。")
         data["protected_secret"] = dandan_protect(secret)
-    elif data.get("app_id") != app_id:
-        data["protected_secret"] = ""
+    elif data.get("protected_secret") and data.get("app_id") != app_id:
+        # Never silently discard a stored secret: a new AppId needs its own key.
+        raise ToolError("AppId 已变更，请同时填写对应的 AppSecret；已保存的密钥未受影响。")
     if enabled and not data.get("protected_secret") and not os.environ.get("DANDANPLAY_APP_SECRET"):
         raise ToolError("启用前请填写 AppSecret。")
     data.update(app_id=app_id, enabled=bool(enabled), version=1)

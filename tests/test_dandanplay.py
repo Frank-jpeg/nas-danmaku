@@ -75,6 +75,20 @@ class DandanplayTests(unittest.TestCase):
         d.save_dandan_config('testapp', '', False)
         self.assertFalse(d.dandan_config()['enabled'])
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows DPAPI')
+    def test_app_id_change_without_new_secret_never_wipes_stored_key(self):
+        d.save_dandan_config('testapp', 'only-a-test-secret', True)
+        for enabled in (True, False):
+            with self.assertRaisesRegex(d.ToolError, 'AppSecret'):
+                d.save_dandan_config('otherapp', '', enabled)
+            saved = d.load_local_json('dandanplay.local.json', {})
+            self.assertEqual(saved['app_id'], 'testapp')
+            self.assertEqual(d.dandan_config()['secret'], 'only-a-test-secret')
+        # Providing the matching new secret is the only way to switch AppId.
+        d.save_dandan_config('otherapp', 'a-different-test-secret', True)
+        self.assertEqual(d.dandan_config()['app_id'], 'otherapp')
+        self.assertEqual(d.dandan_config()['secret'], 'a-different-test-secret')
+
     def test_match_hashes_only_first_16mb_and_omits_directory_and_extension(self):
         video = self.folder / 'Movie.mkv'
         head = b'A' * (16 * 1024 * 1024)

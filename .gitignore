@@ -20,6 +20,8 @@ Thumbs.db
 *.local.toml
 *.pem
 *.key
+*.bak
+*.bak-*
 
 # 影片、字幕、真实接口响应和导出物均不进入源码仓库
 *.mkv
